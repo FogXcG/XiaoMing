@@ -1,0 +1,26 @@
+{
+  "id": "session_lifecycle",
+  "inputs": [
+    "/session",
+    "/sessions",
+    "/new",
+    "/session"
+  ],
+  "timeout_seconds": 30,
+  "assertions": {
+    "exit_code": 0,
+    "stdout_contains": [
+      "Started new session:",
+      "Session:",
+      "Title: New session",
+      "Started new session.",
+      "Session items: 0"
+    ],
+    "stdout_not_contains": [
+      "Error:"
+    ],
+    "files_exist": [
+      ".xiaoming/sessions/index.json"
+    ]
+  }
+}

@@ -1,0 +1,34 @@
+{
+  "id": "cancel_scheduled_task_from_chat",
+  "inputs": [
+    "帮我开发一个简单的五子棋网页",
+    "取消刚才的任务"
+  ],
+  "timeout_seconds": 180,
+  "assertions": {
+    "exit_code": 0,
+    "duration_less_than_seconds": 90,
+    "stdout_contains": [
+      "schedule_background_task",
+      "cancel_background_task"
+    ],
+    "stdout_not_contains": [
+      "Error:",
+      "Traceback",
+      "Primary coordinator cannot execute",
+      "unknown task_id",
+      "本轮已经查询过 background_tasks_status"
+    ],
+    "session_contains": [
+      "schedule_background_task",
+      "cancel_background_task"
+    ],
+    "session_not_contains": [
+      "\"name\": \"write_file\"",
+      "\"name\": \"shell\"",
+      "\"name\": \"apply_patch\"",
+      "unknown task_id",
+      "本轮已经查询过 background_tasks_status"
+    ]
+  }
+}

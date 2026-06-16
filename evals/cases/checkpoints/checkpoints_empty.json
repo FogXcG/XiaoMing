@@ -1,0 +1,19 @@
+{
+  "id": "checkpoints_empty",
+  "inputs": [
+    "/checkpoints",
+    "/rewind"
+  ],
+  "timeout_seconds": 30,
+  "assertions": {
+    "exit_code": 0,
+    "stdout_contains": [
+      "No checkpoints.",
+      "No checkpoint to restore."
+    ],
+    "stdout_not_contains": [
+      "Error:",
+      "Traceback"
+    ]
+  }
+}

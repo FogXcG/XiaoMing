@@ -1,0 +1,20 @@
+{
+  "id": "deepseek_weather",
+  "inputs": [
+    "帮我查下西安明天的天气"
+  ],
+  "timeout_seconds": 180,
+  "assertions": {
+    "exit_code": 0,
+    "stdout_not_contains": [
+      "Error:"
+    ],
+    "log_contains": [
+      "\"tool\": \"web_search\"",
+      "\"status\": \"success\""
+    ],
+    "session_contains": [
+      "Search backend: deepseek_anthropic"
+    ]
+  }
+}

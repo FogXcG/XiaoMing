@@ -1,0 +1,23 @@
+{
+  "id": "log_path_and_startup",
+  "inputs": [
+    "/logs"
+  ],
+  "timeout_seconds": 30,
+  "assertions": {
+    "exit_code": 0,
+    "stdout_contains": [
+      ".xiaoming/logs/xiaoming.log"
+    ],
+    "stdout_not_contains": [
+      "Error:",
+      "Traceback"
+    ],
+    "log_contains": [
+      "cli_started"
+    ],
+    "files_exist": [
+      ".xiaoming/logs/xiaoming.log"
+    ]
+  }
+}

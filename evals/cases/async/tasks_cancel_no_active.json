@@ -1,0 +1,22 @@
+{
+  "id": "tasks_cancel_no_active",
+  "inputs": [
+    "/tasks",
+    "/cancel",
+    "/cancel all",
+    "/quiet",
+    "/verbose"
+  ],
+  "timeout_seconds": 30,
+  "assertions": {
+    "exit_code": 0,
+    "stdout_contains": [
+      "Background notices reduced.",
+      "Background notices restored."
+    ],
+    "stdout_not_contains": [
+      "Error:",
+      "Traceback"
+    ]
+  }
+}

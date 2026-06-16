@@ -1,0 +1,22 @@
+{
+  "id": "status_clear_context",
+  "inputs": [
+    "/status",
+    "/context",
+    "/clear",
+    "/status"
+  ],
+  "timeout_seconds": 30,
+  "assertions": {
+    "exit_code": 0,
+    "stdout_contains": [
+      "Provider: deepseek",
+      "Model: deepseek-v4-flash",
+      "Context cleared.",
+      "Session items: 0"
+    ],
+    "stdout_not_contains": [
+      "Error:"
+    ]
+  }
+}

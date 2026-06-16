@@ -1,0 +1,25 @@
+{
+  "id": "project_rule_persistence",
+  "inputs": [
+    "/ask Shell(git *)",
+    "/deny Bash(rm *)",
+    "/permissions"
+  ],
+  "timeout_seconds": 30,
+  "assertions": {
+    "exit_code": 0,
+    "stdout_contains": [
+      "Added project rule: ask Shell(git *)",
+      "Added project rule: deny Bash(rm *)",
+      "ask Shell(git *) [project]",
+      "deny Bash(rm *) [project]"
+    ],
+    "stdout_not_contains": [
+      "Error:",
+      "Traceback"
+    ],
+    "files_exist": [
+      ".xiaoming/permissions.json"
+    ]
+  }
+}

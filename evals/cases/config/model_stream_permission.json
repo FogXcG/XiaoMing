@@ -1,0 +1,32 @@
+{
+  "id": "model_stream_permission",
+  "inputs": [
+    "/model",
+    "/stream off",
+    "/stream",
+    "/permission-mode auto",
+    "/permission-mode",
+    "/allow Bash(pytest *)",
+    "/permissions"
+  ],
+  "timeout_seconds": 30,
+  "assertions": {
+    "exit_code": 0,
+    "stdout_contains": [
+      "Provider: deepseek",
+      "Model: deepseek-v4-flash",
+      "Stream disabled. Context cleared.",
+      "Stream: off",
+      "Permission mode set to auto. Context cleared.",
+      "Permission mode: auto",
+      "Added project rule: allow Bash(pytest *)",
+      "allow Bash(pytest *) [project]"
+    ],
+    "stdout_not_contains": [
+      "Error:"
+    ],
+    "files_exist": [
+      ".xiaoming/permissions.json"
+    ]
+  }
+}

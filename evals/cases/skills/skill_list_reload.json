@@ -1,0 +1,19 @@
+{
+  "id": "skill_list_reload",
+  "inputs": [
+    "/skills",
+    "/skill reload",
+    "/skills"
+  ],
+  "timeout_seconds": 30,
+  "assertions": {
+    "exit_code": 0,
+    "stdout_contains": [
+      "Skills reloaded."
+    ],
+    "stdout_not_contains": [
+      "Error:",
+      "Traceback"
+    ]
+  }
+}

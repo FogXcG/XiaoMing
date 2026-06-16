@@ -1,0 +1,22 @@
+{
+  "id": "simple_qa_no_background_task",
+  "inputs": [
+    "1+1等于几？只回答数字。"
+  ],
+  "timeout_seconds": 120,
+  "assertions": {
+    "exit_code": 0,
+    "stdout_contains": [
+      "2"
+    ],
+    "stdout_not_contains": [
+      "Error:",
+      "Traceback",
+      "Running tool: schedule_background_task",
+      "Running tool: web_search"
+    ],
+    "session_not_contains": [
+      "Search backend:"
+    ]
+  }
+}

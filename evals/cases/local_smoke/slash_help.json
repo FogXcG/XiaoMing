@@ -1,0 +1,17 @@
+{
+  "id": "slash_help",
+  "inputs": ["/"],
+  "timeout_seconds": 30,
+  "assertions": {
+    "exit_code": 0,
+    "stdout_contains": [
+      "Xiaoming chat.",
+      "Commands:",
+      "/tasks",
+      "/exit"
+    ],
+    "stdout_not_contains": [
+      "Error:"
+    ]
+  }
+}

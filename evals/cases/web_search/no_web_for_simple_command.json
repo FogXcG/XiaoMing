@@ -1,0 +1,23 @@
+{
+  "id": "no_web_for_simple_command",
+  "inputs": [
+    "/status"
+  ],
+  "timeout_seconds": 30,
+  "assertions": {
+    "exit_code": 0,
+    "stdout_contains": [
+      "Provider: deepseek",
+      "Model: deepseek-v4-flash"
+    ],
+    "session_contains": [
+      "session_meta"
+    ],
+    "session_not_contains": [
+      "Search backend:"
+    ],
+    "stdout_not_contains": [
+      "Error:"
+    ]
+  }
+}

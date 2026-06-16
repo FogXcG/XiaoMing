@@ -1,0 +1,37 @@
+{
+  "id": "schedule_coding_task",
+  "inputs": [
+    "帮我开发一个简单的五子棋网页"
+  ],
+  "timeout_seconds": 180,
+  "assertions": {
+    "exit_code": 0,
+    "duration_less_than_seconds": 60,
+    "stdout_contains": [
+      "schedule_background_task"
+    ],
+    "stdout_not_contains": [
+      "Error:",
+      "Traceback",
+      "Running tool: write_file",
+      "Running tool: shell",
+      "Running tool: apply_patch",
+      "write denied by user",
+      "command denied by user",
+      "patch denied by user",
+      "Primary coordinator cannot execute",
+      "unknown task_id",
+      "本轮已经查询过 background_tasks_status"
+    ],
+    "session_contains": [
+      "schedule_background_task"
+    ],
+    "session_not_contains": [
+      "\"name\": \"write_file\"",
+      "\"name\": \"shell\"",
+      "\"name\": \"apply_patch\"",
+      "unknown task_id",
+      "本轮已经查询过 background_tasks_status"
+    ]
+  }
+}

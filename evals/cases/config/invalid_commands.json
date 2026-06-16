@@ -1,0 +1,24 @@
+{
+  "id": "invalid_commands",
+  "inputs": [
+    "/model nope",
+    "/provider other",
+    "/permission-mode unsafe",
+    "/stream maybe",
+    "/allow broken"
+  ],
+  "timeout_seconds": 30,
+  "assertions": {
+    "exit_code": 0,
+    "stdout_contains": [
+      "Usage: /model <openai|deepseek> <model>",
+      "Provider must be openai or deepseek.",
+      "Permission mode must be default, plan, accept_edits, auto, or bypass.",
+      "Usage: /stream on|off",
+      "Usage: /allow Tool(pattern)"
+    ],
+    "stdout_not_contains": [
+      "Traceback"
+    ]
+  }
+}
