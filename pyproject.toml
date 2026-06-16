@@ -1,0 +1,33 @@
+[project]
+name = "xiaoming-agent"
+version = "0.1.0"
+description = "Local CLI coding agent MVP using OpenAI Responses API tool calling"
+requires-python = ">=3.11"
+dependencies = [
+  "openai>=1.0.0",
+  "socksio>=1.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0.0",
+]
+
+[project.scripts]
+xiaoming = "xiaoming.cli:main"
+xiaoming-cli = "xiaoming.cli:main"
+xiaoming-eval = "xiaoming.evals.runner:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+markers = [
+  "openai: requires OPENAI_API_KEY and calls the OpenAI API",
+  "deepseek: requires DEEPSEEK_API_KEY and calls the DeepSeek API",
+]
+
+[tool.setuptools.package-data]
+xiaoming = [
+  "prompts/*.md",
+  "builtin_skills/*/SKILL.md",
+]
