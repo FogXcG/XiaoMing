@@ -2,6 +2,25 @@
 
 A personal AI agent with hierarchical memory, async task coordination, and tool orchestration — built as a local CLI agent, designed to evolve into a JARVIS-like personal assistant.
 
+## Roadmap
+
+- [x] Core agent loop with LLM multi-provider (DeepSeek, OpenAI)
+- [x] Tool system (15+ tools) with permissions and safety policy
+- [x] Streaming inference with context compaction
+- [x] Persistent sessions and file checkpoints
+- [x] Skills system (discovery, loading, installation)
+- [x] Web search and web fetch
+- [x] Hooks extension system
+- [x] Async worker coordination with LLM scheduler
+- [x] Worker verification and auto-revision loop
+- [x] Dream hierarchical memory (fragments, diaries, dream runner)
+- [x] Eval harness and terminal-bench adapter
+- [ ] Voice interaction — combine with XiaoBai's real-time voice capabilities
+- [ ] Self-evolution — candidate worktrees, smoke tests, safe activation
+- [ ] Agent-to-Agent communication — natural-language messaging between Xiaoming instances
+- [ ] Multi-platform — desktop, phone, wearable, home device
+- [ ] JARVIS — voice × async agent = personal AI assistant
+
 ## Features
 
 ### Agent Runtime
