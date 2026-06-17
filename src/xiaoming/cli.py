@@ -41,6 +41,7 @@ from xiaoming.tools.background_task import BackgroundTasksStatusTool, CancelBack
 from xiaoming.tools.base import Tool, ToolResult
 from xiaoming.tools.edit_file import EditFileTool
 from xiaoming.tools.git_status import GitStatusTool
+from xiaoming.tools.fetch_skill import FetchSkillTool
 from xiaoming.tools.install_skill import InstallSkillTool
 from xiaoming.tools.list_files import ListFilesTool
 from xiaoming.tools.load_skill import LoadSkillTool
@@ -308,6 +309,7 @@ def build_registry(
         tools.append(ShellTool(workspace, approval_mode=approval_mode, approve=approve, permission_engine=permission_engine))
     if skill_library is not None and include_skill_install_tool:
         tools.append(InstallSkillTool(workspace, skill_library, approval_mode=approval_mode, approve=approve))
+        tools.append(FetchSkillTool(workspace, skill_library))
     if include_load_skill_tool and skill_library is not None and skill_library.skills:
         tools.append(LoadSkillTool(skill_library, workspace=workspace))
     if extra_tools:

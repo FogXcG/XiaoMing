@@ -365,6 +365,14 @@ class AgentLoop:
                         session.remember_loaded_skill(loaded)
                         _log(self.logger, "info", "loaded_skill_remembered", skill=loaded.name, path=loaded.path, content_hash=loaded.content_hash)
                         _record(self.session_recorder, session.session_id, "loaded_skill", loaded.to_payload())
+                if call.name == "fetch_skill" and result.status == "success":
+                    skill_name = _extract_skill_name_from_fetch_result(result.output)
+                    if skill_name:
+                        loaded = _loaded_skill_from_library(self.skill_library, skill_name)
+                        if loaded is not None:
+                            session.remember_loaded_skill(loaded)
+                            _log(self.logger, "info", "fetch_skill_loaded", skill=loaded.name, path=loaded.path, content_hash=loaded.content_hash)
+                            _record(self.session_recorder, session.session_id, "loaded_skill", loaded.to_payload())
                 _record(
                     self.session_recorder,
                     session.session_id,
@@ -684,9 +692,6 @@ class AgentLoop:
         if self.skill_library is None:
             return None
         parts = []
-        available = self.skill_library.render_available()
-        if available:
-            parts.append(available)
         selected = self.skill_library.select_for_task(user_task)
         if selected:
             for skill in selected:
@@ -851,6 +856,13 @@ def _loaded_skill_from_library(library: SkillLibrary | None, requested_name: str
         content=skill.content,
         path=str(skill.path) if skill.path is not None else "",
     )
+
+
+def _extract_skill_name_from_fetch_result(output: str) -> str | None:
+    """Extract the skill name from a <fetch_skill_result> block."""
+    import re
+    match = re.search(r"<name>(.*?)</name>", output)
+    return match.group(1).strip() if match else None
 
 
 def _log(logger: XiaomingLogger | None, level: str, event: str, **fields) -> None:

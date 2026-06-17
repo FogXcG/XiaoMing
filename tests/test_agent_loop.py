@@ -1514,7 +1514,9 @@ def test_agent_loop_does_not_auto_inject_unmentioned_semantic_skill_matches():
     assert "Ask before implementation." not in rendered
 
 
-def test_agent_loop_advertises_available_skills_without_full_content():
+def test_agent_loop_does_not_inject_skill_list_into_prompt():
+    """Skill names and descriptions are no longer injected into the prompt;
+    only skills matched by $name or plain text in the user task are included."""
     provider = FakeProvider()
     loop = AgentLoop(
         provider=provider,
@@ -1530,10 +1532,30 @@ def test_agent_loop_advertises_available_skills_without_full_content():
     loop.run("写页面")
 
     rendered = "\n".join(str(item.get("content") or "") for item in provider.requests[0].input_items)
-    assert "Available skills:" in rendered
-    assert "frontend - Build UI." in rendered
-    assert "load_skill" in rendered
+    # Full skill list should NOT be injected into the prompt
+    assert "Available skills:" not in rendered
+    # Full skill content should NOT be in the prompt unless matched
     assert "Use semantic markup." not in rendered
+
+
+def test_agent_loop_injects_matched_skill_for_dollar_syntax():
+    """Skills matched by $name syntax should still be injected."""
+    provider = FakeProvider()
+    loop = AgentLoop(
+        provider=provider,
+        registry=ToolRegistry([DummyTool()]),
+        instructions="rules",
+        model="gpt-5",
+        temperature=0.2,
+        max_output_tokens=4096,
+        max_turns=3,
+        skill_library=SkillLibrary([Skill(name="frontend", description="Build UI.", content="Use semantic markup.")]),
+    )
+
+    loop.run("用 $frontend 写页面")
+
+    rendered = "\n".join(str(item.get("content") or "") for item in provider.requests[0].input_items)
+    assert "Use semantic markup." in rendered
 
 
 def test_agent_loop_can_load_skill_through_tool():

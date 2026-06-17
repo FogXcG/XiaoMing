@@ -15,3 +15,10 @@ Rules:
 - If a command requires approval, request it through the tool result flow.
 - If information is insufficient, inspect more context or ask the user.
 - When done, summarize changed files and verification results.
+
+For specialized tasks (frontend frameworks, databases, DevOps, specific libraries,
+or unfamiliar technologies), load the built-in "find-skills" skill first. It guides
+you through discovering relevant skills from the web. Found skills are downloaded
+with fetch_skill and cached in .agents/skills/ for future use.
+
+For common tasks you can handle with your base knowledge, skip skill search.
