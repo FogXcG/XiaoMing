@@ -18,6 +18,7 @@ WorkerEventKind = Literal[
     "decision_request",
     "reported",
     "completed",
+    "peer_reply",
     "failed",
     "cancelled",
 ]

@@ -481,6 +481,78 @@ def test_worker_main_continues_after_review_feedback(monkeypatch, tmp_path):
     assert "missing README" in tasks[1]
 
 
+def test_worker_main_replies_to_inbound_talk_without_task_completion(monkeypatch, tmp_path):
+    tasks = []
+
+    class FakeRegistry:
+        def specs(self):
+            return []
+
+    class FakeLoop:
+        registry = FakeRegistry()
+        skill_library = None
+
+        def run(self, task, session=None, on_event=None):
+            tasks.append(task)
+            return f"answer-{len(tasks)}"
+
+    monkeypatch.setattr(worker_main, "build_loop", lambda *args, **kwargs: FakeLoop())
+    stdin = StringIO(
+        encode_message("start_task", task_id="task-1", task="do work", workspace=str(tmp_path))
+        + encode_message("talk", message="怎么运行？")
+        + encode_message("review_accepted", message="accepted")
+    )
+    stdout = StringIO()
+    monkeypatch.setattr("sys.stdin", stdin)
+    monkeypatch.setattr("sys.stdout", stdout)
+
+    result = worker_main.main()
+
+    events = [decode_message(line) for line in stdout.getvalue().splitlines()]
+    terminal_events = [event["kind"] for event in events if event["kind"] in {"peer_reply", "completed"}]
+    assert result == 0
+    assert terminal_events == ["peer_reply", "completed"]
+    assert [event["message"] for event in events if event["kind"] == "peer_reply"] == ["answer-2"]
+    assert [event["message"] for event in events if event["kind"] == "completed"] == ["answer-1"]
+    assert tasks[1] == "怎么运行？"
+
+
+def test_worker_main_handles_queued_talk_before_task_completion(monkeypatch, tmp_path):
+    tasks = []
+
+    class FakeRegistry:
+        def specs(self):
+            return []
+
+    class FakeLoop:
+        registry = FakeRegistry()
+        skill_library = None
+
+        def run(self, task, session=None, on_event=None):
+            tasks.append(task)
+            return f"answer-{len(tasks)}"
+
+    monkeypatch.setattr(worker_main, "build_loop", lambda *args, **kwargs: FakeLoop())
+    stdin = StringIO(
+        encode_message("start_task", task_id="task-1", task="do work", workspace=str(tmp_path))
+        + encode_message("talk", message="怎么运行？")
+        + encode_message("review_accepted", message="accepted")
+    )
+    stdout = StringIO()
+    monkeypatch.setattr("sys.stdin", stdin)
+    monkeypatch.setattr("sys.stdout", stdout)
+
+    result = worker_main.main()
+
+    events = [decode_message(line) for line in stdout.getvalue().splitlines()]
+    terminal_events = [event["kind"] for event in events if event["kind"] in {"peer_reply", "completed"}]
+    assert result == 0
+    assert terminal_events == ["peer_reply", "completed"]
+    assert events[-1]["kind"] == "completed"
+    assert events[-1]["message"] == "answer-1"
+    assert tasks[1] == "怎么运行？"
+
+
 def test_worker_main_uses_streamed_text_when_loop_return_is_suppressed(monkeypatch, tmp_path):
     class FakeRegistry:
         def specs(self):

@@ -56,6 +56,27 @@ class WorkerInbox:
             self.queue.put(message)
         return [message for message in appends if message.strip()]
 
+    def drain_queued_work(self) -> tuple[list[str], list[str]]:
+        appends: list[str] = []
+        talks: list[str] = []
+        retained: list[dict] = []
+        while True:
+            message = self.get(timeout=0)
+            if message is None:
+                break
+            kind = message.get("kind")
+            if kind == "cancel":
+                self.cancelled = True
+            elif kind == "append_user_message":
+                appends.append(str(message.get("message") or ""))
+            elif kind == "talk":
+                talks.append(str(message.get("message") or ""))
+            else:
+                retained.append(message)
+        for message in retained:
+            self.queue.put(message)
+        return [message for message in appends if message.strip()], [message for message in talks if message.strip()]
+
     def _read_stdin(self) -> None:
         try:
             for line in sys.stdin:
@@ -150,18 +171,31 @@ def main() -> int:
                 _inject_worker_bootstrap_contexts(workspace, session, logger)
                 _inject_preloaded_skills(session, loop.skill_library, skills_to_preload, logger)
             if forked_instructions:
-                pending_tasks = [_forked_worker_directive(agent, task_spec, context_packet)]
+                pending_tasks = [(_forked_worker_directive(agent, task_spec, context_packet), False)]
             else:
                 _inject_worker_agent_context(session, agent)
                 _inject_worker_protocol_context(session)
                 _inject_worker_context_packet(session, context_packet)
                 _inject_worker_task_contract(session, task_spec)
-                pending_tasks = ["Start working on the task contract provided in context."]
-            while pending_tasks:
+                pending_tasks = [("Start working on the task contract provided in context.", False)]
+            pending_completion: str | None = None
+            while pending_tasks or pending_completion is not None:
                 if inbox.cancelled:
                     write_message(protocol_out, "cancelled", task_id=task_id, message="Task cancelled.")
                     return 1
-                current = pending_tasks.pop(0)
+                if not pending_tasks and pending_completion is not None:
+                    answer = pending_completion
+                    pending_completion = None
+                    write_message(protocol_out, "completed", task_id=task_id, message=answer)
+                    followup = _wait_for_review_followup(inbox)
+                    if followup is None:
+                        return 0
+                    if followup == ("__cancelled__", False):
+                        write_message(protocol_out, "cancelled", task_id=task_id, message="Task cancelled.")
+                        return 1
+                    pending_tasks.append(followup)
+                    continue
+                current, is_talk = pending_tasks.pop(0)
                 streamed_text: list[str] = []
 
                 def on_progress(event: str | ProgressEvent) -> None:
@@ -178,17 +212,33 @@ def main() -> int:
                 if answer.startswith("Error:"):
                     write_message(protocol_out, "failed", task_id=task_id, message=answer, data={"error_kind": "agent_loop_error"})
                     return 1
-                appended = inbox.drain_appends()
-                if appended:
+                appended, queued_talks = inbox.drain_queued_work()
+                if appended or (queued_talks and not is_talk):
                     if answer:
-                        write_message(protocol_out, "progress", task_id=task_id, message=answer)
-                    pending_tasks.extend(appended)
+                        if is_talk:
+                            write_message(protocol_out, "peer_reply", task_id=task_id, message=answer)
+                        else:
+                            pending_completion = answer
+                    pending_tasks.extend((message, False) for message in appended)
+                    pending_tasks.extend((message, True) for message in queued_talks)
+                    continue
+                if is_talk:
+                    write_message(protocol_out, "peer_reply", task_id=task_id, message=answer)
+                    if pending_tasks or pending_completion is not None:
+                        continue
+                    followup = _wait_for_review_followup(inbox)
+                    if followup is None:
+                        return 0
+                    if followup == ("__cancelled__", False):
+                        write_message(protocol_out, "cancelled", task_id=task_id, message="Task cancelled.")
+                        return 1
+                    pending_tasks.append(followup)
                     continue
                 write_message(protocol_out, "completed", task_id=task_id, message=answer)
                 followup = _wait_for_review_followup(inbox)
                 if followup is None:
                     return 0
-                if followup == "__cancelled__":
+                if followup == ("__cancelled__", False):
                     write_message(protocol_out, "cancelled", task_id=task_id, message="Task cancelled.")
                     return 1
                 pending_tasks.append(followup)
@@ -211,10 +261,10 @@ def _emit_progress(protocol_out, task_id: str, event: str | ProgressEvent) -> No
     write_message(protocol_out, "progress", task_id=task_id, message=event)
 
 
-def _wait_for_review_followup(inbox: WorkerInbox) -> str | None:
+def _wait_for_review_followup(inbox: WorkerInbox) -> tuple[str, bool] | None:
     while True:
         if inbox.cancelled:
-            return "__cancelled__"
+            return ("__cancelled__", False)
         payload = inbox.get(timeout=0.1)
         if payload is None:
             if inbox.closed:
@@ -222,15 +272,19 @@ def _wait_for_review_followup(inbox: WorkerInbox) -> str | None:
             continue
         kind = payload.get("kind")
         if kind == "cancel":
-            return "__cancelled__"
+            return ("__cancelled__", False)
         if kind == "review_accepted":
             return None
         if kind == "review_feedback":
-            return _review_feedback_prompt(str(payload.get("feedback") or ""))
+            return (_review_feedback_prompt(str(payload.get("feedback") or "")), False)
         if kind == "append_user_message":
             message = str(payload.get("message") or "").strip()
             if message:
-                return message
+                return (message, False)
+        if kind == "talk":
+            message = str(payload.get("message") or "").strip()
+            if message:
+                return (message, True)
 
 
 def _review_feedback_prompt(feedback: str) -> str:
