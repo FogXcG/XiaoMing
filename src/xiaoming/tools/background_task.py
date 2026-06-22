@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from typing import Any, Callable
 
 from xiaoming.async_runtime.tasks import TaskSpec
@@ -28,8 +29,9 @@ class ScheduleBackgroundTaskTool:
         "additionalProperties": False,
     }
 
-    def __init__(self, coordinator_getter: Callable[[], Any]):
+    def __init__(self, coordinator_getter: Callable[[], Any], turn_context_getter: Callable[[], str] | None = None):
         self.coordinator_getter = coordinator_getter
+        self.turn_context_getter = turn_context_getter
 
     @property
     def spec(self) -> ToolSpec:
@@ -41,10 +43,32 @@ class ScheduleBackgroundTaskTool:
         if not message:
             return ToolResult(self.name, "error", error="message is required")
         task_spec = TaskSpec.from_request(message, title=task_name or None)
+        turn_context = self.turn_context_getter() if self.turn_context_getter is not None else ""
+        requested_executor = _requested_executor_from_turn_context(turn_context)
+        if requested_executor:
+            task_spec.notes = _append_internal_note(task_spec.notes, f"requested_executor={requested_executor}")
         coordinator = self.coordinator_getter()
         if coordinator is None:
             return ToolResult(self.name, "error", error="background coordinator is not running")
         return coordinator.schedule_background_task(task_spec)
+
+
+def _requested_executor_from_turn_context(text: str) -> str:
+    normalized = text.lower()
+    if re.search(r"(?:用|使用|让|请|调用|交给)\s*codex(?![a-z0-9_])", normalized):
+        return "codex"
+    if re.search(r"(?<![a-z0-9_])codex\s*(?:帮|来|处理|开发|写|执行|做)", normalized):
+        return "codex"
+    return ""
+
+
+def _append_internal_note(notes: str, note: str) -> str:
+    stripped = notes.strip()
+    if not stripped:
+        return note
+    if note in stripped.splitlines():
+        return stripped
+    return f"{stripped}\n{note}"
 
 
 class BackgroundTasksStatusTool:
@@ -137,6 +161,37 @@ class CancelBackgroundTaskTool:
         if coordinator is None:
             return ToolResult(self.name, "error", error="background coordinator is not running")
         return coordinator.cancel_task(str(args.get("task_id") or ""))
+
+
+class TalkToPeerTool:
+    name = "talk_to_peer"
+    description = (
+        "Send a natural language message to an existing peer such as a background worker, and return its reply. "
+        "Use this for questions, discussion, follow-up, or natural continuation with an existing peer. "
+        "This is a transparent talk channel: it does not create a new background task and does not trigger task verification."
+    )
+    input_schema = {
+        "type": "object",
+        "properties": {
+            "peer_id": {"type": "string"},
+            "message": {"type": "string"},
+        },
+        "required": ["peer_id", "message"],
+        "additionalProperties": False,
+    }
+
+    def __init__(self, coordinator_getter: Callable[[], Any]):
+        self.coordinator_getter = coordinator_getter
+
+    @property
+    def spec(self) -> ToolSpec:
+        return ToolSpec(self.name, self.description, self.input_schema)
+
+    def run(self, args: dict[str, Any]) -> ToolResult:
+        coordinator = self.coordinator_getter()
+        if coordinator is None:
+            return ToolResult(self.name, "error", error="background coordinator is not running")
+        return coordinator.talk_to_peer(str(args.get("peer_id") or ""), str(args.get("message") or ""))
 
 
 class ReplyMailboxMessageTool:

@@ -42,6 +42,8 @@ Use `web_search` to find skills. Example queries:
 - For popular sources: `vercel-labs/agent-skills skills`
 - Check https://skills.sh/ leaderboard for top skills
 
+If the local `skills` CLI is available, `npx skills find <query>` can be used as a discovery aid only. Do not install with the CLI; use the native skill tools in the following steps.
+
 ### Step 3: Verify Quality
 
 Before recommending a skill:

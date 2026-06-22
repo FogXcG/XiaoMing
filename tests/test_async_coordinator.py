@@ -5,6 +5,7 @@ from pathlib import Path
 
 from xiaoming.async_runtime.coordinator import AsyncCoordinator, CoordinatorConfig, MAX_REVISION_ATTEMPTS
 from xiaoming.async_runtime.events import WorkerEvent
+from xiaoming.async_runtime.external_sessions import ExternalSessionRecord
 from xiaoming.async_runtime.mailbox import MailboxStore
 from xiaoming.async_runtime.question_decider import WorkerQuestionDecision
 from xiaoming.async_runtime.responder import ResponderError
@@ -168,6 +169,309 @@ def test_coordinator_schedules_normal_message_without_immediate_reply(tmp_path: 
     assert reply == ""
     assert workers[0].config.task == "写 README"
     assert any("动态调度：启动任务" in notice.message for notice in notices)
+
+
+def test_coordinator_talks_to_internal_worker_without_completing_task(tmp_path: Path):
+    workers = []
+
+    def factory(config, on_event):
+        worker = FakeWorker(config, on_event)
+        workers.append(worker)
+        return worker
+
+    coordinator = AsyncCoordinator(CoordinatorConfig(tmp_path), scheduler=FakeScheduler(), responder=FakeResponder(), worker_factory=factory, verifier=RecordingVerifier())
+    coordinator.start()
+    try:
+        coordinator.submit_user_message("写 README")
+        _eventually(lambda: len(workers) == 1)
+        task = coordinator.registry.list()[0]
+
+        def reply():
+            _eventually(lambda: workers[0].sent == [("talk", {"message": "怎么运行？"})])
+            workers[0].on_event(WorkerEvent(task.task_id, "peer_reply", "运行 pytest"))
+
+        thread = threading.Thread(target=reply, daemon=True)
+        thread.start()
+        result = coordinator.talk_to_peer(task.task_id, "怎么运行？")
+        thread.join(timeout=1)
+        status_before_stop = task.status
+        submissions_before_stop = list(task.worker_submissions)
+    finally:
+        coordinator.stop()
+
+    assert result.status == "success"
+    assert result.output == "运行 pytest"
+    assert status_before_stop == "running"
+    assert submissions_before_stop == []
+
+
+def test_coordinator_talk_accepts_visible_short_task_id(tmp_path: Path):
+    workers = []
+
+    def factory(config, on_event):
+        worker = FakeWorker(config, on_event)
+        workers.append(worker)
+        return worker
+
+    coordinator = AsyncCoordinator(CoordinatorConfig(tmp_path), scheduler=FakeScheduler(), responder=FakeResponder(), worker_factory=factory, verifier=RecordingVerifier())
+    coordinator.start()
+    try:
+        coordinator.submit_user_message("写 README")
+        _eventually(lambda: len(workers) == 1)
+        task = coordinator.registry.list()[0]
+        short_id = task.task_id[:8]
+
+        def reply():
+            _eventually(lambda: workers[0].sent == [("talk", {"message": "进度？"})])
+            workers[0].on_event(WorkerEvent(task.task_id, "peer_reply", "正在处理"))
+
+        thread = threading.Thread(target=reply, daemon=True)
+        thread.start()
+        result = coordinator.talk_to_peer(short_id, "进度？")
+        thread.join(timeout=1)
+        status_before_stop = task.status
+    finally:
+        coordinator.stop()
+
+    assert result.status == "success"
+    assert result.output == "正在处理"
+    assert status_before_stop == "running"
+
+
+def test_coordinator_talk_to_needs_user_decision_resumes_worker_without_waiting(tmp_path: Path):
+    workers = []
+
+    def factory(config, on_event):
+        worker = FakeWorker(config, on_event)
+        workers.append(worker)
+        return worker
+
+    coordinator = AsyncCoordinator(CoordinatorConfig(tmp_path), scheduler=FakeScheduler(), responder=FakeResponder(), worker_factory=factory, verifier=RecordingVerifier())
+    coordinator.start()
+    try:
+        coordinator.submit_user_message("写围棋")
+        _eventually(lambda: len(workers) == 1)
+        task = coordinator.registry.list()[0]
+        task.needs_user_decision_summary = "CLI or web GUI?"
+        task.transition("needs_user_decision", task.needs_user_decision_summary)
+
+        result = coordinator.talk_to_peer(task.task_id[:8], "简单的网页吧")
+        sent = list(workers[0].sent)
+        status = task.status
+        progress = task.last_progress
+    finally:
+        coordinator.stop()
+
+    assert result.status == "success"
+    assert "已转交" in result.output
+    assert status == "running"
+    assert progress == "user decision sent to worker"
+    assert sent[-1][0] == "review_feedback"
+    assert "简单的网页吧" in sent[-1][1]["feedback"]
+    assert "CLI or web GUI?" in sent[-1][1]["feedback"]
+
+
+def test_coordinator_routes_explicit_codex_task_to_external_worker(monkeypatch, tmp_path: Path):
+    started = []
+
+    class FakeCodexWorker:
+        def __init__(self, config, on_event):
+            self.config = config
+            self.on_event = on_event
+            self.pid = None
+
+        def start(self):
+            started.append(self.config.task)
+            self.on_event(
+                WorkerEvent(
+                    self.config.task_id,
+                    "completed",
+                    "codex done",
+                    {"external_provider": "codex", "external_session_id": "codex-thread-1"},
+                )
+            )
+
+        def send(self, kind, **payload):
+            pass
+
+        def terminate(self, timeout_seconds=5):
+            pass
+
+    monkeypatch.setattr("xiaoming.async_runtime.coordinator.CodexWorkerProcess", FakeCodexWorker)
+    coordinator = AsyncCoordinator(CoordinatorConfig(tmp_path), scheduler=FakeScheduler(), responder=FakeResponder(), verifier=RecordingVerifier())
+    coordinator.start()
+    try:
+        result = coordinator.schedule_background_task("请使用 Codex 写 README")
+        _eventually(lambda: coordinator.registry.list()[0].status == "accepted")
+        task = coordinator.registry.list()[0]
+        external = coordinator.external_sessions[task.task_id]
+    finally:
+        coordinator.stop()
+
+    assert result.status == "success"
+    assert started == ["请使用 Codex 写 README"]
+    assert task.agent_type == "codex"
+    assert external.provider == "codex"
+    assert external.session_id == "codex-thread-1"
+
+
+def test_coordinator_routes_codex_task_from_internal_route_note(monkeypatch, tmp_path: Path):
+    started = []
+
+    class FakeCodexWorker:
+        def __init__(self, config, on_event):
+            self.config = config
+            self.on_event = on_event
+            self.pid = None
+
+        def start(self):
+            started.append(self.config.task)
+            self.on_event(
+                WorkerEvent(
+                    self.config.task_id,
+                    "completed",
+                    "codex done",
+                    {"external_provider": "codex", "external_session_id": "codex-thread-1"},
+                )
+            )
+
+        def send(self, kind, **payload):
+            pass
+
+        def terminate(self, timeout_seconds=5):
+            pass
+
+    monkeypatch.setattr("xiaoming.async_runtime.coordinator.CodexWorkerProcess", FakeCodexWorker)
+    coordinator = AsyncCoordinator(CoordinatorConfig(tmp_path), scheduler=FakeScheduler(), responder=FakeResponder(), verifier=RecordingVerifier())
+    coordinator.start()
+    try:
+        spec = TaskSpec(title="开发象棋网页", goal="开发一个简单的中国象棋网页", notes="requested_executor=codex")
+        result = coordinator.schedule_background_task(spec)
+        _eventually(lambda: coordinator.registry.list()[0].status == "accepted")
+        task = coordinator.registry.list()[0]
+    finally:
+        coordinator.stop()
+
+    assert result.status == "success"
+    assert started == ["开发一个简单的中国象棋网页"]
+    assert task.agent_type == "codex"
+
+
+def test_coordinator_records_external_session_from_codex_progress(monkeypatch, tmp_path: Path):
+    class FakeCodexWorker:
+        def __init__(self, config, on_event):
+            self.config = config
+            self.on_event = on_event
+            self.pid = None
+
+        def start(self):
+            self.on_event(
+                WorkerEvent(
+                    self.config.task_id,
+                    "progress",
+                    "Codex is still working; waiting for the next event.",
+                    {"external_provider": "codex", "external_session_id": "codex-thread-1"},
+                )
+            )
+
+        def send(self, kind, **payload):
+            pass
+
+        def terminate(self, timeout_seconds=5):
+            pass
+
+    monkeypatch.setattr("xiaoming.async_runtime.coordinator.CodexWorkerProcess", FakeCodexWorker)
+    coordinator = AsyncCoordinator(CoordinatorConfig(tmp_path), scheduler=FakeScheduler(), responder=FakeResponder(), verifier=RecordingVerifier())
+    coordinator.start()
+    try:
+        spec = TaskSpec(title="开发象棋网页", goal="开发一个简单的中国象棋网页", notes="requested_executor=codex")
+        result = coordinator.schedule_background_task(spec)
+        _eventually(lambda: coordinator.registry.list()[0].last_progress == "Codex is still working; waiting for the next event.")
+        task = coordinator.registry.list()[0]
+        external = coordinator.external_sessions[task.task_id]
+    finally:
+        coordinator.stop()
+
+    assert result.status == "success"
+    assert task.status == "running"
+    assert external.session_id == "codex-thread-1"
+    assert external.status == "active"
+
+
+def test_coordinator_talks_to_completed_external_codex_session(monkeypatch, tmp_path: Path):
+    calls = []
+
+    class FakeCodexSession:
+        def __init__(self, workspace, session_id="", timeout_seconds=900):
+            self.workspace = workspace
+            self.session_id = session_id
+            self.timeout_seconds = timeout_seconds
+
+        def send(self, message):
+            calls.append((self.session_id, message))
+            return "打开 index.html", self.session_id
+
+    monkeypatch.setattr("xiaoming.async_runtime.coordinator.CodexRemoteControlSession", FakeCodexSession)
+    coordinator = AsyncCoordinator(CoordinatorConfig(tmp_path), scheduler=FakeScheduler(), responder=FakeResponder())
+    task = TaskRecord(title="Codex 象棋", original_request="用 codex 写象棋", current_goal="用 codex 写象棋", status="accepted", agent_type="codex")
+    coordinator.registry.add(task)
+    coordinator.external_sessions[task.task_id] = ExternalSessionRecord(
+        peer_id=task.task_id,
+        provider="codex",
+        title=task.title,
+        workspace=str(tmp_path),
+        session_id="codex-thread-1",
+    )
+
+    result = coordinator.talk_to_peer(task.task_id[:8], "怎么运行？")
+
+    assert result.status == "success"
+    assert result.output == "打开 index.html"
+    assert calls == [("codex-thread-1", "怎么运行？")]
+
+
+def test_coordinator_sends_needs_user_decision_to_external_codex_without_waiting(monkeypatch, tmp_path: Path):
+    calls = []
+
+    class FakeCodexSession:
+        def __init__(self, workspace, session_id="", timeout_seconds=900):
+            self.workspace = workspace
+            self.session_id = session_id
+            self.timeout_seconds = timeout_seconds
+
+        def send(self, message, on_progress=None):
+            calls.append((self.session_id, message))
+            if on_progress is not None:
+                on_progress("Codex is still working; waiting for the next event.")
+            return "created web go", self.session_id
+
+    monkeypatch.setattr("xiaoming.async_runtime.coordinator.CodexRemoteControlSession", FakeCodexSession)
+    coordinator = AsyncCoordinator(CoordinatorConfig(tmp_path), scheduler=FakeScheduler(), responder=FakeResponder(), verifier=RecordingVerifier())
+    task = TaskRecord(title="围棋开发", original_request="使用 codex 写围棋", current_goal="使用 codex 写围棋", status="needs_user_decision", agent_type="codex")
+    task.needs_user_decision_summary = "CLI or web GUI?"
+    coordinator.registry.add(task)
+    coordinator.external_sessions[task.task_id] = ExternalSessionRecord(
+        peer_id=task.task_id,
+        provider="codex",
+        title=task.title,
+        workspace=str(tmp_path),
+        session_id="codex-thread-1",
+    )
+    coordinator.start()
+    try:
+        result = coordinator.talk_to_peer(task.task_id[:8], "简单的网页吧")
+        _eventually(lambda: coordinator.registry.list()[0].status == "accepted")
+        final_task = coordinator.registry.list()[0]
+    finally:
+        coordinator.stop()
+
+    assert result.status == "success"
+    assert "已转交" in result.output
+    assert calls
+    assert calls[0][0] == "codex-thread-1"
+    assert "简单的网页吧" in calls[0][1]
+    assert "CLI or web GUI?" in calls[0][1]
+    assert final_task.last_progress == "created web go"
 
 
 def test_schedule_background_task_starts_worker_without_scheduler_notice(tmp_path: Path):

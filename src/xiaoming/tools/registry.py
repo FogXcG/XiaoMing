@@ -84,6 +84,9 @@ class ToolRegistry:
         if name == "cancel_background_task":
             task_id = args.get("task_id")
             return f"cancel background task {task_id}" if task_id else "cancel background task"
+        if name == "talk_to_peer":
+            peer_id = args.get("peer_id")
+            return f"talk to peer {peer_id}" if peer_id else "talk to peer"
         if name == "reply_mailbox_message":
             message_id = args.get("message_id")
             return f"reply mailbox message {message_id}" if message_id else "reply mailbox message"

@@ -37,7 +37,7 @@ from xiaoming.skill_installer import SkillInstallError, install_skill_from_url
 from xiaoming.skills import SkillLibrary
 from xiaoming.tools.apply_patch import ApplyPatchTool
 from xiaoming.tools.append_file import AppendFileTool
-from xiaoming.tools.background_task import BackgroundTasksStatusTool, CancelBackgroundTaskTool, FollowBackgroundTaskTool, ReplyMailboxMessageTool, ScheduleBackgroundTaskTool
+from xiaoming.tools.background_task import BackgroundTasksStatusTool, CancelBackgroundTaskTool, FollowBackgroundTaskTool, ReplyMailboxMessageTool, ScheduleBackgroundTaskTool, TalkToPeerTool
 from xiaoming.tools.base import Tool, ToolResult
 from xiaoming.tools.edit_file import EditFileTool
 from xiaoming.tools.git_status import GitStatusTool
@@ -123,6 +123,7 @@ ORCHESTRATOR_ALLOWED_TOOLS = {
     "background_tasks_status",
     "follow_background_task",
     "cancel_background_task",
+    "talk_to_peer",
     "reply_mailbox_message",
 }
 READ_ONLY_ALLOWED_TOOLS = {
@@ -153,12 +154,17 @@ class ForegroundTurnResult:
     pending_user_input: str | None = None
 
 
-def build_universal_runtime_tools(coordinator_getter: Callable[[], object | None], talk_callback: TalkCallback) -> list[Tool]:
+def build_universal_runtime_tools(
+    coordinator_getter: Callable[[], object | None],
+    talk_callback: TalkCallback,
+    turn_context_getter: Callable[[], str] | None = None,
+) -> list[Tool]:
     return [
-        ScheduleBackgroundTaskTool(coordinator_getter),
+        ScheduleBackgroundTaskTool(coordinator_getter, turn_context_getter=turn_context_getter),
         BackgroundTasksStatusTool(coordinator_getter),
         FollowBackgroundTaskTool(coordinator_getter),
         CancelBackgroundTaskTool(coordinator_getter),
+        TalkToPeerTool(coordinator_getter),
         ReplyMailboxMessageTool(coordinator_getter),
         TalkTool(talk_callback),
     ]
@@ -192,7 +198,7 @@ def tool_capability_hook(profile: CapabilityProfile) -> Callable[[dict], dict | 
             if tool in SKILL_INSTALL_ALLOWED_TOOLS:
                 return None
             return {"decision": "deny", "reason": "This worker installs skills through install_skill; do not use shell, git clone, write tools, or background task management tools."}
-        if tool in {"schedule_background_task", "background_tasks_status", "follow_background_task", "cancel_background_task", "reply_mailbox_message"}:
+        if tool in {"schedule_background_task", "background_tasks_status", "follow_background_task", "cancel_background_task", "talk_to_peer", "reply_mailbox_message"}:
             return {"decision": "deny", "reason": "Background workers cannot manage the coordinator's task queue; use talk when you need coordinator or user input."}
         return None
 
@@ -440,6 +446,7 @@ class ChatRuntime:
         self.async_coordinator: AsyncCoordinator | None = None
         self.async_notice_handler: Callable[[CoordinatorNotice], None] = _print_async_notice
         self.foreground_task: ForegroundTask | None = None
+        self.active_user_input: str = ""
         self.session_record, self.resumed_existing_session = self._select_session()
         self.session = self._load_session(self.session_record)
         self._ensure_bootstrap_contexts()
@@ -475,6 +482,7 @@ class ChatRuntime:
                     extra_tools=build_universal_runtime_tools(
                         coordinator_getter=lambda: self.async_coordinator,
                         talk_callback=unavailable_talk_callback,
+                        turn_context_getter=lambda: self.active_user_input,
                     ),
                     pending_worker_questions=self._pending_worker_questions_for_input,
                     include_skill_context=False,
@@ -651,6 +659,14 @@ class ChatRuntime:
             return self.loop.skill_library.list_text()
         return SkillLibrary.discover(self.workspace).list_text()
 
+    def talk_to_peer(self, peer_id: str, message: str) -> str:
+        if self.async_coordinator is None:
+            return "Peer talk is only available in xiaoming-cli async runtime mode."
+        result = self.async_coordinator.talk_to_peer(peer_id, message)
+        if result.status == "success":
+            return result.output
+        return f"peer talk failed: {result.error or result.output}"
+
     def should_use_async_chat(self) -> bool:
         return self.loop_factory is build_loop
 
@@ -758,6 +774,7 @@ Rules:
 - When calling schedule_background_task, pass only message and optionally task_name. Put any user-stated constraints in message.
 - For progress questions, call background_tasks_status at most once in that turn and answer from the snapshot.
 - If the user explicitly asks you to wait, follow, or watch a specific background task, use follow_background_task with the task_id. If the task_id is unknown, call background_tasks_status once first.
+- When the user asks a natural language question or follow-up for an existing worker or peer, call talk_to_peer with the exact peer/task id and the user's message. Talk is transparent and does not mean task completion.
 - To cancel a background task, call cancel_background_task with the exact task_id. If the task_id is unknown, call background_tasks_status first.
 - For multiple cancellations, call cancel_background_task once per task. Do not claim cancellation unless the tool succeeds.
 - If replacing a background task, cancel the old task first, then schedule the replacement.
@@ -872,6 +889,16 @@ def run_chat(runtime_or_loop) -> int:
             else:
                 print(runtime.async_coordinator.tasks_text())
             continue
+        if user_input.startswith("/talk"):
+            if runtime is None or runtime.async_coordinator is None:
+                print("Peer talk is only available in xiaoming-cli async runtime mode.")
+            else:
+                parts = user_input.split(maxsplit=2)
+                if len(parts) < 3:
+                    print("Usage: /talk <peer-id> <message>")
+                else:
+                    print(runtime.talk_to_peer(parts[1], parts[2]))
+            continue
         if user_input == "/quiet":
             if runtime is not None and runtime.async_coordinator is not None:
                 runtime.async_coordinator.set_quiet(True)
@@ -970,6 +997,7 @@ def run_chat(runtime_or_loop) -> int:
 def _run_foreground_turn(runtime: ChatRuntime, user_input: str, async_notices: "AsyncNoticeBuffer") -> ForegroundTurnResult:
     checkpoint = runtime.checkpoint_store.create(runtime.session.session_id, user_input)
     runtime.active_checkpoint_id = checkpoint.id
+    runtime.active_user_input = user_input
     cancel_requested = threading.Event()
     done = threading.Event()
     result: dict[str, object] = {}
@@ -995,6 +1023,7 @@ def _run_foreground_turn(runtime: ChatRuntime, user_input: str, async_notices: "
         print(runtime.move_foreground_task_to_background())
     done.wait()
     runtime.active_checkpoint_id = None
+    runtime.active_user_input = ""
     if "exception" in result:
         runtime.finish_foreground_task("failed")
         raise result["exception"]  # type: ignore[misc]
@@ -1362,6 +1391,7 @@ def _help_text() -> str:
         "/compact\n"
         "/dream\n"
         "/tasks\n"
+        "/talk <peer-id> <message>\n"
         "/cancel\n"
         "/cancel all\n"
         "/quiet\n"

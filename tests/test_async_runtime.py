@@ -79,6 +79,49 @@ def test_schedule_background_task_accepts_plain_message():
     assert coordinator.task_spec.skills_to_preload == []
 
 
+def test_schedule_background_task_preserves_codex_request_from_turn_context():
+    class FakeCoordinator:
+        def __init__(self):
+            self.task_spec = None
+
+        def schedule_background_task(self, task_spec):
+            self.task_spec = task_spec
+            return ToolResult("schedule_background_task", "success", output="ok")
+
+    coordinator = FakeCoordinator()
+    tool = ScheduleBackgroundTaskTool(
+        lambda: coordinator,
+        turn_context_getter=lambda: "帮我用codex开发一个简单的象棋",
+    )
+
+    result = tool.run({"message": "开发一个简单的中国象棋网页", "task_name": "开发象棋网页"})
+
+    assert result.status == "success"
+    assert coordinator.task_spec.title == "开发象棋网页"
+    assert "requested_executor=codex" in coordinator.task_spec.notes
+
+
+def test_schedule_background_task_does_not_route_plain_codex_mentions():
+    class FakeCoordinator:
+        def __init__(self):
+            self.task_spec = None
+
+        def schedule_background_task(self, task_spec):
+            self.task_spec = task_spec
+            return ToolResult("schedule_background_task", "success", output="ok")
+
+    coordinator = FakeCoordinator()
+    tool = ScheduleBackgroundTaskTool(
+        lambda: coordinator,
+        turn_context_getter=lambda: "帮我写一个类似 codex 的介绍页面",
+    )
+
+    result = tool.run({"message": "写一个介绍页面", "task_name": "介绍页面"})
+
+    assert result.status == "success"
+    assert "requested_executor=codex" not in coordinator.task_spec.notes
+
+
 def test_llm_verifier_response_parses_json_object():
     result = _verification_from_json('```json\n{"accepted": true, "reasons": ["ok"]}\n```')
 

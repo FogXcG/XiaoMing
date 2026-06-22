@@ -13,6 +13,7 @@ from typing import Callable
 from xiaoming.async_runtime.agents import builtin_agent_registry
 from xiaoming.async_runtime.context_packets import ContextPacketBuilder
 from xiaoming.async_runtime.events import CoordinatorNotice, Question, UserMessage, WorkerEvent
+from xiaoming.async_runtime.external_sessions import CodexRemoteControlSession, CodexWorkerProcess, ExternalSessionRecord, ExternalSessionStore
 from xiaoming.async_runtime.question_decider import WorkerQuestionDecider, WorkerQuestionDecision
 from xiaoming.async_runtime.responder import CoordinatorResponder, ResponderError
 from xiaoming.async_runtime.scheduler import Scheduler, SchedulerDecision, SchedulerError
@@ -64,15 +65,19 @@ class AsyncCoordinator:
             raise ValueError("AsyncCoordinator requires an explicit responder")
         self.scheduler = scheduler
         self.responder = responder
+        self._uses_default_worker_factory = worker_factory is None
         self.worker_factory = worker_factory or (lambda worker_config, on_event: WorkerProcess(worker_config, on_event))
         self.on_notice = on_notice
         self.task_store = TaskStore(config.workspace)
         self.registry = self.task_store.load_registry()
+        self.external_session_store = ExternalSessionStore(config.workspace)
+        self.external_sessions: dict[str, ExternalSessionRecord] = {record.peer_id: record for record in self.external_session_store.load()}
         self.mailbox = self.task_store.load_mailbox()
         self._cancel_mailbox_messages_for_terminal_tasks()
         self._input_queue: queue.Queue[UserMessage] = queue.Queue()
         self._worker_events: queue.Queue[WorkerEvent] = queue.Queue()
         self._workers: dict[str, WorkerProcess] = {}
+        self._peer_reply_queues: dict[str, queue.Queue[str]] = {}
         self._verifier_workers: dict[str, WorkerProcess] = {}
         self._verifier_parent_ids: dict[str, str] = {}
         self._stop = threading.Event()
@@ -162,6 +167,128 @@ class AsyncCoordinator:
             if not tasks:
                 return "当前没有后台任务。"
             return "\n".join(self._task_status_line_locked(task) for task in tasks)
+
+    def talk_to_peer(self, peer_id: str, message: str) -> ToolResult:
+        requested_peer_id = peer_id.strip()
+        text = message.strip()
+        if not requested_peer_id:
+            return ToolResult("talk_to_peer", "error", error="peer_id is required")
+        if not text:
+            return ToolResult("talk_to_peer", "error", error="message is required")
+        external: ExternalSessionRecord | None = None
+        reply_queue: queue.Queue[str] | None = None
+        with self._lock:
+            normalized_peer_id, resolve_error = self._resolve_peer_id_locked(requested_peer_id)
+            if resolve_error:
+                return ToolResult("talk_to_peer", "error", error=resolve_error)
+            worker = self._workers.get(normalized_peer_id)
+            if worker is None:
+                external = self.external_sessions.get(normalized_peer_id)
+                if external is None:
+                    return ToolResult("talk_to_peer", "error", error=f"unknown peer: {normalized_peer_id}")
+                task = self.registry.get(normalized_peer_id)
+                if task is not None and task.status == "needs_user_decision":
+                    return self._send_external_user_decision_locked(task, external, text)
+                external.status = "active"
+                external.updated_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                self._persist_external_sessions_locked()
+                self._persist()
+            else:
+                task = self.registry.get(normalized_peer_id)
+                if task is not None and task.status == "needs_user_decision":
+                    feedback = _user_decision_feedback(task, text)
+                    task.needs_user_decision_summary = ""
+                    task.transition("running", "user decision sent to worker")
+                    worker.send("review_feedback", feedback=feedback, reasons=[feedback], attempt=task.revision_attempts, max_attempts=self.config.max_revision_attempts)
+                    self._persist()
+                    return ToolResult("talk_to_peer", "success", output=f"已转交给 {task.title}，后台会继续处理。")
+                reply_queue = queue.Queue(maxsize=1)
+                self._peer_reply_queues[normalized_peer_id] = reply_queue
+                worker.send("talk", message=text)
+                if task is not None:
+                    task.transition(task.status, "talk sent to worker")
+                    self._persist()
+        if external is not None:
+            return self._talk_to_external_peer(normalized_peer_id, external, text)
+        assert reply_queue is not None
+        return self._wait_for_internal_peer_reply(normalized_peer_id, reply_queue)
+
+    def _send_external_user_decision_locked(self, task: TaskRecord, external: ExternalSessionRecord, message: str) -> ToolResult:
+        feedback = _user_decision_feedback(task, message)
+        task.needs_user_decision_summary = ""
+        task.transition("running", "user decision sent to external peer")
+        external.status = "active"
+        external.updated_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        self._persist_external_sessions_locked()
+        self._persist()
+
+        def _run() -> None:
+            data = {"external_provider": external.provider, "external_session_id": external.session_id}
+            if external.provider != "codex":
+                self._worker_events.put(WorkerEvent(task.task_id, "failed", f"unsupported external peer provider: {external.provider}", data))
+                return
+            session = CodexRemoteControlSession(self.config.workspace, session_id=external.session_id, timeout_seconds=float(self.config.model_timeout_seconds or 900))
+            try:
+                answer, session_id = session.send(
+                    feedback,
+                    on_progress=lambda progress: self._worker_events.put(
+                        WorkerEvent(task.task_id, "progress", progress, {"external_provider": "codex", "external_session_id": session.session_id})
+                    ),
+                )
+            except Exception as exc:
+                self._worker_events.put(WorkerEvent(task.task_id, "failed", f"external Codex worker failed: {exc}", data))
+                return
+            self._worker_events.put(WorkerEvent(task.task_id, "completed", answer, {"external_provider": "codex", "external_session_id": session_id}))
+
+        threading.Thread(target=_run, daemon=True).start()
+        return ToolResult("talk_to_peer", "success", output=f"已转交给 {task.title}，后台会继续处理。")
+
+    def _resolve_peer_id_locked(self, peer_id: str) -> tuple[str, str]:
+        if peer_id in self._workers:
+            return peer_id, ""
+        if peer_id in self.external_sessions:
+            return peer_id, ""
+        candidates = set(self._workers) | set(self.external_sessions)
+        matches = sorted(task_id for task_id in candidates if task_id.startswith(peer_id))
+        if len(matches) == 1:
+            return matches[0], ""
+        if len(matches) > 1:
+            return "", f"ambiguous peer_id prefix {peer_id}: {', '.join(match[:8] for match in matches)}"
+        return peer_id, ""
+
+    def _talk_to_external_peer(self, peer_id: str, external: ExternalSessionRecord, message: str) -> ToolResult:
+        if external.provider != "codex":
+            return ToolResult("talk_to_peer", "error", error=f"unsupported external peer provider: {external.provider}")
+        session = CodexRemoteControlSession(self.config.workspace, session_id=external.session_id, timeout_seconds=float(self.config.model_timeout_seconds or 900))
+        try:
+            answer, session_id = session.send(message)
+        except Exception as exc:
+            with self._lock:
+                external.status = "failed"
+                external.updated_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                self._persist_external_sessions_locked()
+            return ToolResult("talk_to_peer", "error", error=f"external Codex talk failed: {exc}")
+        with self._lock:
+            external.session_id = session_id or external.session_id
+            external.status = "active"
+            external.updated_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            self._persist_external_sessions_locked()
+            task = self.registry.get(peer_id)
+            if task is not None:
+                task.transition(task.status, "external peer replied")
+                self._persist()
+        return ToolResult("talk_to_peer", "success", output=answer)
+
+    def _wait_for_internal_peer_reply(self, task_id: str, reply_queue: queue.Queue[str], timeout_seconds: float = 120) -> ToolResult:
+        try:
+            reply = reply_queue.get(timeout=timeout_seconds)
+        except queue.Empty:
+            with self._lock:
+                self._peer_reply_queues.pop(task_id, None)
+            return ToolResult("talk_to_peer", "error", error=f"peer reply timed out after {timeout_seconds:g}s")
+        with self._lock:
+            self._peer_reply_queues.pop(task_id, None)
+        return ToolResult("talk_to_peer", "success", output=reply)
 
     def follow_task(self, task_id: str, timeout_seconds: float = FOLLOW_TASK_TIMEOUT_SECONDS) -> ToolResult:
         normalized_task_id = task_id.strip()
@@ -363,7 +490,19 @@ class AsyncCoordinator:
             forked_input_items=list(task.forked_input_items),
             forked_loaded_skills=list(task.forked_loaded_skills),
         )
-        worker = self.worker_factory(worker_config, self._worker_events.put)
+        if self._uses_default_worker_factory and _should_use_codex(task):
+            task.agent_type = "codex"
+            worker = CodexWorkerProcess(worker_config, self._worker_events.put)
+            self.external_sessions[task.task_id] = ExternalSessionRecord(
+                peer_id=task.task_id,
+                provider="codex",
+                title=task.title,
+                workspace=str(self.config.workspace),
+                status="running",
+            )
+            self._persist_external_sessions_locked()
+        else:
+            worker = self.worker_factory(worker_config, self._worker_events.put)
         self._workers[task.task_id] = worker
         worker.start()
         task.worker_pid = worker.pid
@@ -456,7 +595,18 @@ class AsyncCoordinator:
                 if parent is not None:
                     self._handle_verifier_worker_event_locked(parent, event)
             return
+        self._record_external_session_from_event_locked(task, event)
         if task.status in {"accepted", "rejected", "failed", "blocked", "cancelled"} and event.kind in {"reported", "completed", "failed", "cancelled"}:
+            return
+        if event.kind == "peer_reply":
+            reply_queue = self._peer_reply_queues.pop(event.task_id, None)
+            if reply_queue is not None:
+                try:
+                    reply_queue.put_nowait(event.message)
+                except queue.Full:
+                    pass
+            task.transition(task.status, "peer replied")
+            self._persist()
             return
         if event.kind in {"approval_request", "clarification_request", "decision_request"}:
             question = Question(
@@ -495,6 +645,7 @@ class AsyncCoordinator:
             self._handle_completed_task_locked(task, event.message)
             return
         if event.kind in {"failed", "cancelled"}:
+            self._mark_external_session_terminal_locked(task, "failed" if event.kind == "failed" else "cancelled")
             self._record_mailbox_status_locked(task, event, kind="result")
             self._workers.pop(task.task_id, None)
             task.transition("failed" if event.kind == "failed" else "cancelled", event.message)
@@ -884,6 +1035,31 @@ class AsyncCoordinator:
         except RuntimeError:
             pass
 
+    def _persist_external_sessions_locked(self) -> None:
+        self.external_session_store.save(list(self.external_sessions.values()))
+
+    def _record_external_session_from_event_locked(self, task: TaskRecord, event: WorkerEvent) -> None:
+        if event.data.get("external_provider") != "codex":
+            return
+        record = self.external_sessions.get(task.task_id)
+        if record is None:
+            record = ExternalSessionRecord(peer_id=task.task_id, provider="codex", title=task.title, workspace=str(self.config.workspace))
+            self.external_sessions[task.task_id] = record
+        session_id = str(event.data.get("external_session_id") or "")
+        if session_id:
+            record.session_id = session_id
+        record.status = "active"
+        record.updated_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        self._persist_external_sessions_locked()
+
+    def _mark_external_session_terminal_locked(self, task: TaskRecord, status: str) -> None:
+        record = self.external_sessions.get(task.task_id)
+        if record is None:
+            return
+        record.status = status
+        record.updated_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        self._persist_external_sessions_locked()
+
     def _mark_pending_mailbox_presented_for_task_locked(self, task_id: str) -> None:
         for message in self.mailbox.pending_reply_messages():
             if message.task_id == task_id:
@@ -1163,6 +1339,30 @@ def _none_if_placeholder(value: str) -> str:
     return cleaned
 
 
+def _should_use_codex(task: TaskRecord) -> bool:
+    if _requested_executor(task) == "codex":
+        return True
+    text = f"{task.title}\n{task.current_goal}\n{task.original_request}".lower()
+    return "codex" in text
+
+
+def _requested_executor(task: TaskRecord) -> str:
+    if task.task_spec is None:
+        return ""
+    for line in task.task_spec.notes.splitlines():
+        key, separator, value = line.partition("=")
+        if separator and key.strip() == "requested_executor":
+            return value.strip().lower()
+    return ""
+
+
+def _user_decision_feedback(task: TaskRecord, user_message: str) -> str:
+    previous = task.needs_user_decision_summary.strip()
+    if previous:
+        return f"User decision/input:\n{user_message.strip()}\n\nPrevious decision request:\n{previous}\n\nContinue the original task using this user decision."
+    return f"User decision/input:\n{user_message.strip()}\n\nContinue the original task using this user decision."
+
+
 def _review_exhausted_summary(task: TaskRecord, report: TaskResultReport, reasons: list[str]) -> str:
     base = task.task_spec or TaskSpec(title=task.title, goal=task.current_goal)
     return (
@@ -1206,7 +1406,8 @@ def _task_status_line(task: TaskRecord, pending_questions: list[str] | None = No
         pending_questions = []
     if pending_questions:
         questions = "  pending: " + " | ".join(pending_questions)
-    return f"{task.task_id[:8]}  {task.title}  {task.status}  {detail}{questions}"
+    agent = f" [{task.agent_type}]" if task.agent_type and task.agent_type != "worker" else ""
+    return f"{task.task_id[:8]}  {task.title}{agent}  {task.status}  {detail}{questions}"
 
 
 def _follow_task_snapshot(task: TaskRecord, changed: bool) -> str:
