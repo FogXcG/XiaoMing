@@ -30,7 +30,8 @@ class WebSearchTool:
     name = "web_search"
     description = (
         "Search the web for current information. Returns titles, URLs, and snippets. "
-        "Use this for recent information or facts outside the repository. Include source URLs in the final answer."
+        "Use this for recent information or facts outside the repository. Include source URLs in the final answer. "
+        "For broad research, make multiple parallel web_search calls with different queries and angles simultaneously."
     )
     supports_parallel_tool_calls = True
     input_schema = {

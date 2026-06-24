@@ -33,14 +33,13 @@ Identify:
 2. The specific task (e.g., writing tests, creating animations, reviewing PRs)
 3. Whether this is a common enough task that a skill likely exists
 
-### Step 2: Search for Skills
+### Step 2: Search for Skills (in parallel)
 
-Use `web_search` to find skills. Example queries:
+Use `web_search` to find skills. **Make multiple searches in parallel** with different queries for broad coverage. Example query sets:
 
-- `skills.sh react best practices`
-- `github.com SKILL.md react component patterns`
-- For popular sources: `vercel-labs/agent-skills skills`
-- Check https://skills.sh/ leaderboard for top skills
+- `skills.sh react best practices` + `github.com SKILL.md react component`
+- `skills.sh {domain}` + `github.com SKILL.md {domain}` + `vercel-labs/agent-skills {domain}`
+- Check https://skills.sh/ leaderboard for top skills in the category
 
 If the local `skills` CLI is available, `npx skills find <query>` can be used as a discovery aid only. Do not install with the CLI; use the native skill tools in the following steps.
 

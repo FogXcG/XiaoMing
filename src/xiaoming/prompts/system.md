@@ -16,6 +16,10 @@ Rules:
 - If information is insufficient, inspect more context or ask the user.
 - When done, summarize changed files and verification results.
 
+When searching the web, make multiple searches in parallel for broad coverage.
+Search from different angles and with different query phrasings. Reading files
+and listing directories can also run in parallel with web searches.
+
 For specialized tasks (frontend frameworks, databases, DevOps, specific libraries,
 or unfamiliar technologies), load the built-in "find-skills" skill first. It guides
 you through discovering relevant skills from the web. Found skills are downloaded
