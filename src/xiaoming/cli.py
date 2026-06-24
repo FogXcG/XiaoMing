@@ -1042,7 +1042,11 @@ def _print_answer(answer: str) -> None:
 def _print_progress(message: str | ProgressEvent) -> None:
     if isinstance(message, ProgressEvent):
         if message.kind == "text_delta":
-            _safe_print(message.message, end=message.end)
+            # Stream deltas directly — they build up on the current line
+            # and should not trigger prompt save/restore on each character.
+            sys.stdout.write(message.message)
+            sys.stdout.write(message.end)
+            sys.stdout.flush()
             return
         _safe_print(f"[xiaoming] {message.message}")
         return
