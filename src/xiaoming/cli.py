@@ -797,9 +797,9 @@ class TuiOutput:
                 self._streaming += text
             else:
                 if self._streaming:
-                    self._lines.append(self._streaming + text)
+                    self._lines.append(self._streaming)
                     self._streaming = ""
-                else:
+                if text:
                     self._lines.append(text)
 
     def flush(self) -> str:
@@ -938,27 +938,25 @@ def run_chat(runtime_or_loop) -> int:
         def _agent_worker():
             try:
                 if runtime is None:
-                    answer = run_loop_with_progress(
+                    run_loop_with_progress(
                         loop, user_input, session=session,
                         on_event=_on_progress_emit,
                     )
-                    if answer:
-                        _emit(answer)
-                        _invalidate_ui()
+                    output.write("")  # complete any pending streaming
+                    _invalidate_ui()
                     return
                 cancel_event.clear()
                 checkpoint = runtime.checkpoint_store.create(runtime.session.session_id, user_input)
                 runtime.active_checkpoint_id = checkpoint.id
                 try:
-                    answer = run_loop_with_progress(
+                    run_loop_with_progress(
                         runtime.loop, user_input,
                         session=session,
                         on_event=_on_progress_emit,
                         should_cancel=cancel_event.is_set,
                     )
-                    if answer:
-                        _emit(answer)
-                        _invalidate_ui()
+                    output.write("")  # complete any pending streaming
+                    _invalidate_ui()
                 finally:
                     runtime.active_checkpoint_id = None
             except Exception as exc:
