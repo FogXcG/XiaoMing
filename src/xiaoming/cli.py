@@ -1,15 +1,22 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import inspect
 import os
-import select
 import sys
 import threading
-import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
+
+from prompt_toolkit import Application
+from prompt_toolkit.buffer import Buffer
+from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.layout import HSplit, Layout, Window
+from prompt_toolkit.layout.controls import FormattedTextControl
+from prompt_toolkit.styles import Style
+from prompt_toolkit.widgets import TextArea
 
 from xiaoming.async_runtime.coordinator import AsyncCoordinator, CoordinatorConfig
 from xiaoming.async_runtime.events import CoordinatorNotice
@@ -776,9 +783,37 @@ Rules:
 - Before calling any tool, briefly state what you are about to do and why in one short sentence.
 """.strip()
 
+class TuiOutput:
+    """Thread-safe output buffer for the prompt_toolkit terminal UI."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._lines: list[str] = []
+        self._streaming: str = ""
+
+    def write(self, text: str, end: str = "\n") -> None:
+        with self._lock:
+            if end == "":
+                self._streaming += text
+            else:
+                if self._streaming:
+                    self._lines.append(self._streaming)
+                    self._streaming = ""
+                self._lines.append(text)
+
+    def flush(self) -> str:
+        with self._lock:
+            if self._streaming:
+                self._lines.append(self._streaming)
+                self._streaming = ""
+            lines = self._lines[:]
+            self._lines.clear()
+            return "\n".join(lines)
+
+
 
 def run_chat(runtime_or_loop) -> int:
-    enable_line_editing()
+    """Run the interactive chat loop with a prompt_toolkit terminal UI."""
     async_notices = AsyncNoticeBuffer()
     if isinstance(runtime_or_loop, ChatRuntime):
         runtime = runtime_or_loop
@@ -787,399 +822,133 @@ def run_chat(runtime_or_loop) -> int:
         runtime = None
         loop = runtime_or_loop
         session = Session()
-    print("Xiaoming chat. Type 'exit' or 'quit' to leave. Type '/' for commands.")
+    startup_lines: list[str] = ["Xiaoming chat. Type 'exit' or 'quit' to leave. Type '/' for commands."]
     if runtime is not None:
-        print(runtime.startup_session_text())
+        startup_lines.append(runtime.startup_session_text())
         if runtime.should_use_async_chat():
             runtime.async_coordinator = runtime.build_async_coordinator(runtime.async_notice_handler)
             runtime.async_coordinator.start()
     async_notices.start()
-    queued_user_inputs: list[str] = []
-    while True:
-        async_notices.flush()
-        if queued_user_inputs:
-            user_input = queued_user_inputs.pop(0).strip()
-        else:
-            try:
-                user_input = _read_user_input("xiaoming> ", async_notices).strip()
-            except KeyboardInterrupt:
-                async_notices.set_input_active(False)
-                discard_pending_terminal_input()
-                if runtime is not None and runtime.async_coordinator is not None:
-                    print()
-                    print(runtime.async_coordinator.cancel_current())
-                    continue
-                raise
-            except EOFError:
-                async_notices.set_input_active(False)
-                async_notices.stop()
-                print()
-                if runtime is not None and runtime.async_coordinator is not None:
-                    runtime.async_coordinator.stop()
-                return 0
+
+    output = TuiOutput()
+    cancel_event = threading.Event()
+
+    def _on_progress(message: str | ProgressEvent) -> None:
+        if isinstance(message, ProgressEvent):
+            if message.kind == "text_delta":
+                output.write(message.message, end="")
+                return
+            output.write(f"[xiaoming] {message.message}")
+            return
+        output.write(f"[xiaoming] {message}")
+
+    # --- Build prompt_toolkit UI ---
+    output_area = TextArea(
+        text="\n".join(startup_lines),
+        read_only=True,
+        scrollbar=True,
+        focusable=False,
+    )
+    input_buffer = Buffer(multiline=False)
+    input_area = TextArea(
+        buffer=input_buffer,
+        prompt="xiaoming> ",
+        multiline=False,
+        height=1,
+        wrap_lines=False,
+    )
+
+    root_container = HSplit([
+        output_area,
+        Window(height=1, char="─", style="class:separator"),
+        input_area,
+    ])
+
+    kb = KeyBindings()
+
+    @kb.add("enter")
+    def _(event):
+        user_input = input_buffer.text.strip()
         if not user_input:
-            continue
-        if user_input in {"exit", "quit"}:
-            async_notices.stop()
-            if runtime is not None and runtime.async_coordinator is not None:
-                runtime.async_coordinator.stop()
-            return 0
-        if user_input in {"/exit", "/quit"}:
-            async_notices.stop()
-            if runtime is not None and runtime.async_coordinator is not None:
-                runtime.async_coordinator.stop()
-            return 0
-        if user_input in {"/", "/help"}:
-            print(_help_text())
-            continue
-        if user_input == "/clear":
-            if runtime is None:
-                session.clear()
-            else:
-                runtime.session.clear()
-            print("Context cleared.")
-            continue
-        if user_input == "/status":
-            if runtime is None:
-                print(f"Session items: {session.item_count}")
-            elif runtime.async_coordinator is not None:
-                print(runtime.status_text())
-                print(runtime.async_coordinator.status_text())
-            else:
-                print(runtime.status_text())
-            continue
-        if user_input == "/context":
-            if runtime is None:
-                print(f"Session items: {session.item_count}")
-            else:
-                print(runtime.context_text())
-            continue
-        if user_input == "/compact":
-            if runtime is None:
-                print("Context compaction is only available in xiaoming-cli runtime mode.")
-            else:
-                try:
-                    print(runtime.compact_context())
-                except Exception as exc:
-                    runtime.logger.error("manual_context_compaction_failed", exc=exc)
-                    print(f"Context compaction failed: {exc}")
-            continue
-        if user_input == "/dream":
-            if runtime is None:
-                print("Dream mode is only available in xiaoming-cli runtime mode.")
-            else:
-                try:
-                    print(runtime.dream_context())
-                except Exception as exc:
-                    runtime.logger.error("manual_dream_failed", exc=exc)
-                    print(f"Dream failed: {exc}")
-            continue
-        if user_input == "/tasks":
-            if runtime is None or runtime.async_coordinator is None:
-                print("Async tasks are only available in xiaoming-cli async runtime mode.")
-            else:
-                print(runtime.async_coordinator.tasks_text())
-            continue
-        if user_input.startswith("/talk"):
-            if runtime is None or runtime.async_coordinator is None:
-                print("Peer talk is only available in xiaoming-cli async runtime mode.")
-            else:
-                parts = user_input.split(maxsplit=2)
-                if len(parts) < 3:
-                    print("Usage: /talk <peer-id> <message>")
-                else:
-                    print(runtime.talk_to_peer(parts[1], parts[2]))
-            continue
-        if user_input == "/quiet":
-            if runtime is not None and runtime.async_coordinator is not None:
-                runtime.async_coordinator.set_quiet(True)
-                print("Background notices reduced.")
-            else:
-                print("Quiet mode is only available in xiaoming-cli async runtime mode.")
-            continue
-        if user_input == "/verbose":
-            if runtime is not None and runtime.async_coordinator is not None:
-                runtime.async_coordinator.set_quiet(False)
-                print("Background notices restored.")
-            else:
-                print("Verbose mode is only available in xiaoming-cli async runtime mode.")
-            continue
-        if user_input.startswith("/cancel"):
-            if runtime is None or runtime.async_coordinator is None:
-                print("Cancel is only available in xiaoming-cli async runtime mode.")
-            elif user_input == "/cancel all":
-                print(runtime.async_coordinator.cancel_all())
-            else:
-                print(runtime.async_coordinator.cancel_current())
-            continue
-        if user_input == "/session":
-            if runtime is None:
-                print(f"Session items: {session.item_count}")
-            else:
-                print(runtime.session_text())
-            continue
-        if user_input == "/sessions":
-            if runtime is None:
-                print("Sessions are only available in xiaoming-cli runtime mode.")
-            else:
-                print(runtime.sessions_text())
-            continue
-        if user_input == "/checkpoints":
-            if runtime is None:
-                print("Checkpoints are only available in xiaoming-cli runtime mode.")
-            else:
-                print(runtime.checkpoints_text())
-            continue
-        if user_input.startswith("/rewind"):
-            if runtime is None:
-                print("Checkpoints are only available in xiaoming-cli runtime mode.")
-            else:
-                parts = user_input.split()
-                print(runtime.restore_checkpoint(parts[1] if len(parts) > 1 else None))
-            continue
-        if user_input == "/new":
-            if runtime is None:
-                session.clear()
-            else:
-                runtime.start_new_session()
-            print("Started new session.")
-            continue
-        if user_input == "/skills":
-            if runtime is None:
-                print("Skills are only available in xiaoming-cli runtime mode.")
-            else:
-                print(runtime.skills_text())
-            continue
-        if user_input == "/logs":
-            if runtime is None:
-                print("Logs are only available in xiaoming-cli runtime mode.")
-            else:
-                print(runtime.logger.path)
-            continue
-        if runtime is not None and _handle_skill_command(runtime, user_input):
-            continue
-        if runtime is not None and _handle_config_command(runtime, user_input):
-            continue
-        try:
-            if runtime is None:
-                _print_answer(run_loop_with_progress(loop, user_input, session=session))
-            else:
-                result = _run_foreground_turn(runtime, user_input, async_notices)
-                _print_answer(result.answer)
-                if result.pending_user_input:
-                    queued_user_inputs.insert(0, result.pending_user_input)
-        except KeyboardInterrupt:
-            discard_pending_terminal_input()
-            if runtime is not None:
-                runtime.logger.error("cli_turn_interrupted", user_input=user_input)
-            print("\nInterrupted current operation.")
-            if runtime is not None:
-                print("Run /rewind to restore changes from this turn.")
-        except Exception as exc:
-            if runtime is not None:
-                runtime.logger.error("cli_turn_exception", exc=exc, user_input=user_input)
-            print(f"Error: {exc}")
-        finally:
-            if runtime is not None:
-                runtime.active_checkpoint_id = None
-            async_notices.flush()
+            return
+        input_buffer.text = ""
+
+        result = _handle_input(user_input, runtime, session, loop,
+                               output, cancel_event if runtime is not None else None,
+                               async_notices)
+        if result == "exit":
+            event.app.exit()
+
+    @kb.add("c-c")
+    def _(event):
+        if runtime is not None and runtime.async_coordinator is not None:
+            output.write(runtime.async_coordinator.cancel_current())
+        else:
+            cancel_event.set()
+
+    style = Style.from_dict({"separator": "fg:#555555"})
+
+    app = Application(
+        layout=Layout(root_container),
+        key_bindings=kb,
+        style=style,
+        full_screen=True,
+    )
+
+    def _refresh_ui():
+        new_text = output.flush()
+        if new_text:
+            current = output_area.buffer.text
+            output_area.buffer.text = (current + "\n" + new_text) if current else new_text
+            output_area.buffer.cursor_position = len(output_area.buffer.text)
+        notices = async_notices.pull()
+        for notice in notices:
+            current = output_area.buffer.text
+            output_area.buffer.text = current + f"\n[xiaoming] {notice.message}"
+
+    def _before_render(_app):
+        _refresh_ui()
+
+    app.before_render += _before_render
+
+    try:
+        app.run()
+    except Exception:
+        pass
+    finally:
+        async_notices.stop()
+        if runtime is not None and runtime.async_coordinator is not None:
+            runtime.async_coordinator.stop()
+    return 0
 
 
-def _run_foreground_turn(runtime: ChatRuntime, user_input: str, async_notices: "AsyncNoticeBuffer") -> ForegroundTurnResult:
-    checkpoint = runtime.checkpoint_store.create(runtime.session.session_id, user_input)
-    runtime.active_checkpoint_id = checkpoint.id
-    runtime.active_user_input = user_input
-    cancel_requested = threading.Event()
-    done = threading.Event()
-    result: dict[str, object] = {}
-
-    def _target() -> None:
-        try:
-            result["answer"] = run_loop_with_progress(
-                runtime.loop,
-                user_input,
-                session=runtime.session,
-                should_cancel=cancel_requested.is_set,
-            )
-        except BaseException as exc:
-            result["exception"] = exc
-        finally:
-            done.set()
-
-    thread = threading.Thread(target=_target, daemon=True)
-    thread.start()
-    pending_user_input = _read_user_input_until_done("xiaoming> ", async_notices, done)
-    if pending_user_input is not None and pending_user_input.strip() and runtime.foreground_task is not None:
-        cancel_requested.set()
-        print(runtime.move_foreground_task_to_background())
-    done.wait()
-    runtime.active_checkpoint_id = None
-    runtime.active_user_input = ""
-    if "exception" in result:
-        runtime.finish_foreground_task("failed")
-        raise result["exception"]  # type: ignore[misc]
-    if pending_user_input is not None and pending_user_input.strip():
-        return ForegroundTurnResult(str(result.get("answer") or ""), pending_user_input.strip())
-    runtime.finish_foreground_task("completed")
-    return ForegroundTurnResult(str(result.get("answer") or ""))
+def _print_async_notice(notice: CoordinatorNotice) -> None:
+    """Default handler for async notices (used outside prompt_toolkit UI)."""
+    print(f"[xiaoming] {notice.message}", flush=True)
 
 
-def run_loop_with_progress(loop, task: str, session: Session | None, should_cancel: Callable[[], bool] | None = None) -> str:
-    signature = inspect.signature(loop.run)
-    kwargs = {"session": session}
-    if "on_event" in signature.parameters:
-        kwargs["on_event"] = _print_progress
-    if "should_cancel" in signature.parameters:
-        kwargs["should_cancel"] = should_cancel
-    return loop.run(task, **kwargs)
+# Backward-compatible stubs (kept for existing test imports)
+def _print_progress(message: str | ProgressEvent) -> None:
+    """Print a progress message (stub; prompt_toolkit UI uses on_event callback)."""
+    if isinstance(message, ProgressEvent):
+        print(message.message, end=message.end, flush=True)
+    else:
+        print(message, flush=True)
 
 
 def _print_answer(answer: str) -> None:
     if answer:
-        _safe_print(answer)
+        print(answer)
 
 
-def _print_progress(message: str | ProgressEvent) -> None:
-    if isinstance(message, ProgressEvent):
-        if message.kind == "text_delta":
-            _safe_print(message.message, end="")
-            return
-        _safe_print(f"[xiaoming] {message.message}")
-        return
-    _safe_print(f"[xiaoming] {message}")
+def _read_user_input(prompt: str, async_notices=None) -> str:
+    return input(prompt)
 
 
-def _print_async_notice(notice: CoordinatorNotice) -> None:
-    _safe_print(f"[xiaoming] {notice.message}")
-
-
-_delta_buf = ""
-
-def _safe_print(text: str, end: str = "\n", prefix: str = "") -> None:
-    """Print output without disrupting the readline input prompt.
-
-    Clears the terminal area below the cursor, prints the output, then
-    redraws the prompt line at the bottom and tells readline to refresh.
-    Streaming text (end="") accumulates in a buffer.
-    """
-    global _delta_buf
-    if not sys.stdin.isatty():
-        sys.stdout.write(f"{prefix}{text}{end}")
-        sys.stdout.flush()
-        return
-    try:
-        import readline
-        if end == "":
-            _delta_buf += text
-            sys.stdout.write(f"\r\033[0J{prefix}{_delta_buf}")
-        else:
-            _delta_buf = ""
-            sys.stdout.write(f"\r\033[0J{prefix}{text}{end}")
-        sys.stdout.write("xiaoming> ")
-        sys.stdout.flush()
-        readline.redisplay()
-    except Exception:
-        sys.stdout.write(f"{prefix}{text}{end}")
-        sys.stdout.flush()
-
-
-def _read_user_input(prompt: str, async_notices: "AsyncNoticeBuffer") -> str:
-    if not sys.stdin.isatty():
-        async_notices.set_input_active(True)
-        try:
-            return input(prompt)
-        finally:
-            async_notices.set_input_active(False)
-    try:
-        import readline
-    except Exception:
-        async_notices.set_input_active(True)
-        try:
-            return input(prompt)
-        finally:
-            async_notices.set_input_active(False)
-    if not hasattr(readline, "callback_handler_install") or not hasattr(readline, "callback_read_char"):
-        async_notices.set_input_active(True)
-        try:
-            return input(prompt)
-        finally:
-            async_notices.set_input_active(False)
-
-    lines: list[str | None] = []
-
-    def _line_ready(line: str | None) -> None:
-        lines.append(line)
-
-    readline.callback_handler_install(prompt, _line_ready)
-    async_notices.set_input_active(True)
-    try:
-        while not lines:
-            async_notices.flush_if_input_empty(redraw_prompt=True)
-            readable, _, _ = select.select([sys.stdin], [], [], async_notices.POLL_SECONDS)
-            if readable:
-                readline.callback_read_char()
-        if lines[0] is None:
-            raise EOFError
-        return lines[0] or ""
-    finally:
-        async_notices.set_input_active(False)
-        try:
-            readline.callback_handler_remove()
-        except Exception:
-            pass
-
-
-def _read_user_input_until_done(prompt: str, async_notices: "AsyncNoticeBuffer", done: threading.Event) -> str | None:
-    if not sys.stdin.isatty():
+def _read_user_input_until_done(prompt: str, async_notices=None, done: threading.Event | None = None) -> str | None:
+    if done is not None:
         done.wait()
-        return None
-    try:
-        import readline
-    except Exception:
-        print(prompt, end="", flush=True)
-        while not done.is_set():
-            readable, _, _ = select.select([sys.stdin], [], [], async_notices.POLL_SECONDS)
-            if readable:
-                line = sys.stdin.readline()
-                if line == "":
-                    raise EOFError
-                return line.rstrip("\n")
-        return None
-    if not hasattr(readline, "callback_handler_install") or not hasattr(readline, "callback_read_char"):
-        print(prompt, end="", flush=True)
-        while not done.is_set():
-            readable, _, _ = select.select([sys.stdin], [], [], async_notices.POLL_SECONDS)
-            if readable:
-                line = sys.stdin.readline()
-                if line == "":
-                    raise EOFError
-                return line.rstrip("\n")
-        return None
-
-    lines: list[str | None] = []
-
-    def _line_ready(line: str | None) -> None:
-        lines.append(line)
-
-    readline.callback_handler_install(prompt, _line_ready)
-    async_notices.set_input_active(True)
-    try:
-        while not lines and not done.is_set():
-            async_notices.flush_if_input_empty(redraw_prompt=True)
-            readable, _, _ = select.select([sys.stdin], [], [], async_notices.POLL_SECONDS)
-            if readable:
-                readline.callback_read_char()
-        if not lines:
-            return None
-        if lines[0] is None:
-            raise EOFError
-        return lines[0] or ""
-    finally:
-        async_notices.set_input_active(False)
-        try:
-            readline.callback_handler_remove()
-        except Exception:
-            pass
+    return None
 
 
 class AsyncNoticeBuffer:
@@ -1188,7 +957,6 @@ class AsyncNoticeBuffer:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._notices: list[CoordinatorNotice] = []
-        self._input_active = False
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
@@ -1205,9 +973,12 @@ class AsyncNoticeBuffer:
     def stop(self) -> None:
         self._stop.set()
 
-    def set_input_active(self, active: bool) -> None:
+    def pull(self) -> list[CoordinatorNotice]:
+        """Return and clear buffered notices. Used by prompt_toolkit UI."""
         with self._lock:
-            self._input_active = active
+            notices = self._notices[:]
+            self._notices.clear()
+        return notices
 
     def flush(self, redraw_prompt: bool = False) -> None:
         with self._lock:
@@ -1219,27 +990,222 @@ class AsyncNoticeBuffer:
             print("xiaoming> ", end="", flush=True)
 
     def flush_if_input_empty(self, redraw_prompt: bool = False) -> bool:
-        with self._lock:
-            should_try_flush = self._input_active and bool(self._notices)
-        if should_try_flush and _readline_buffer_empty():
-            self.flush(redraw_prompt=redraw_prompt)
-            return True
+        # Kept for API compatibility; no-op in prompt_toolkit mode.
         return False
 
     def _watch_empty_input(self) -> None:
         while not self._stop.wait(self.POLL_SECONDS):
-            self.flush_if_input_empty(redraw_prompt=True)
+            pass
 
 
-def _readline_buffer_empty() -> bool:
-    if not sys.stdin.isatty():
-        return False
-    try:
-        import readline
+def _handle_input(user_input: str, runtime, session, loop, output: TuiOutput,
+                  cancel_event: threading.Event | None,
+                  async_notices) -> str | None:
+    """Handle one line of user input. Returns 'exit' if the app should quit."""
+    if user_input in {"exit", "quit", "/exit", "/quit"}:
+        return "exit"
 
-        return not readline.get_line_buffer()
-    except Exception:
-        return False
+    if user_input in {"/", "/help"}:
+        output.write(_help_text())
+        return None
+
+    if user_input == "/clear":
+        if runtime is None:
+            session.clear()
+        else:
+            runtime.session.clear()
+        output.write("Context cleared.")
+        return None
+
+    if user_input == "/status":
+        if runtime is None:
+            output.write(f"Session items: {session.item_count}")
+        elif runtime.async_coordinator is not None:
+            output.write(runtime.status_text())
+            output.write(runtime.async_coordinator.status_text())
+        else:
+            output.write(runtime.status_text())
+        return None
+
+    if user_input == "/context":
+        if runtime is None:
+            output.write(f"Session items: {session.item_count}")
+        else:
+            output.write(runtime.context_text())
+        return None
+
+    if user_input == "/compact":
+        if runtime is None:
+            output.write("Context compaction is only available in xiaoming-cli runtime mode.")
+        else:
+            try:
+                output.write(runtime.compact_context())
+            except Exception as exc:
+                runtime.logger.error("manual_context_compaction_failed", exc=exc)
+                output.write(f"Context compaction failed: {exc}")
+        return None
+
+    if user_input == "/dream":
+        if runtime is None:
+            output.write("Dream mode is only available in xiaoming-cli runtime mode.")
+        else:
+            try:
+                output.write(runtime.dream_context())
+            except Exception as exc:
+                runtime.logger.error("manual_dream_failed", exc=exc)
+                output.write(f"Dream failed: {exc}")
+        return None
+
+    if user_input == "/tasks":
+        if runtime is None or runtime.async_coordinator is None:
+            output.write("Async tasks are only available in xiaoming-cli async runtime mode.")
+        else:
+            output.write(runtime.async_coordinator.tasks_text())
+        return None
+
+    if user_input.startswith("/talk"):
+        if runtime is None or runtime.async_coordinator is None:
+            output.write("Peer talk is only available in xiaoming-cli async runtime mode.")
+        else:
+            parts = user_input.split(maxsplit=2)
+            if len(parts) < 3:
+                output.write("Usage: /talk <peer-id> <message>")
+            else:
+                output.write(runtime.talk_to_peer(parts[1], parts[2]))
+        return None
+
+    if user_input == "/quiet":
+        if runtime is not None and runtime.async_coordinator is not None:
+            runtime.async_coordinator.set_quiet(True)
+            output.write("Background notices reduced.")
+        else:
+            output.write("Quiet mode is only available in xiaoming-cli async runtime mode.")
+        return None
+
+    if user_input == "/verbose":
+        if runtime is not None and runtime.async_coordinator is not None:
+            runtime.async_coordinator.set_quiet(False)
+            output.write("Background notices restored.")
+        else:
+            output.write("Verbose mode is only available in xiaoming-cli async runtime mode.")
+        return None
+
+    if user_input.startswith("/cancel"):
+        if runtime is None or runtime.async_coordinator is None:
+            output.write("Cancel is only available in xiaoming-cli async runtime mode.")
+        elif user_input == "/cancel all":
+            output.write(runtime.async_coordinator.cancel_all())
+        else:
+            output.write(runtime.async_coordinator.cancel_current())
+        return None
+
+    if user_input == "/session":
+        if runtime is None:
+            output.write(f"Session items: {session.item_count}")
+        else:
+            output.write(runtime.session_text())
+        return None
+
+    if user_input == "/sessions":
+        if runtime is None:
+            output.write("Sessions are only available in xiaoming-cli runtime mode.")
+        else:
+            output.write(runtime.sessions_text())
+        return None
+
+    if user_input == "/checkpoints":
+        if runtime is None:
+            output.write("Checkpoints are only available in xiaoming-cli runtime mode.")
+        else:
+            output.write(runtime.checkpoints_text())
+        return None
+
+    if user_input.startswith("/rewind"):
+        if runtime is None:
+            output.write("Checkpoints are only available in xiaoming-cli runtime mode.")
+        else:
+            parts = user_input.split()
+            output.write(runtime.restore_checkpoint(parts[1] if len(parts) > 1 else None))
+        return None
+
+    if user_input == "/new":
+        if runtime is None:
+            session.clear()
+        else:
+            runtime.start_new_session()
+        output.write("Started new session.")
+        return None
+
+    if user_input == "/skills":
+        if runtime is None:
+            output.write("Skills are only available in xiaoming-cli runtime mode.")
+        else:
+            output.write(runtime.skills_text())
+        return None
+
+    if user_input == "/logs":
+        if runtime is None:
+            output.write("Logs are only available in xiaoming-cli runtime mode.")
+        else:
+            output.write(str(runtime.logger.path))
+        return None
+
+    if runtime is not None and _handle_skill_command(runtime, user_input):
+        return None
+
+    if runtime is not None and _handle_config_command(runtime, user_input):
+        return None
+
+    # Run agent in background thread
+    def _agent_worker():
+        try:
+            if cancel_event is not None:
+                cancel_event.clear()
+            if runtime is None:
+                answer = run_loop_with_progress(
+                    loop, user_input, session=session,
+                    on_event=lambda msg: (
+                        output.write(msg.message, end="") if isinstance(msg, ProgressEvent) and msg.kind == "text_delta"
+                        else output.write(f"[xiaoming] {msg.message}") if isinstance(msg, ProgressEvent)
+                        else output.write(f"[xiaoming] {msg}")
+                    ))
+                if answer:
+                    output.write(answer)
+            else:
+                checkpoint = runtime.checkpoint_store.create(runtime.session.session_id, user_input)
+                runtime.active_checkpoint_id = checkpoint.id
+                try:
+                    answer = run_loop_with_progress(
+                        runtime.loop, user_input,
+                        session=runtime.session,
+                        on_event=lambda msg: (
+                            output.write(msg.message, end="") if isinstance(msg, ProgressEvent) and msg.kind == "text_delta"
+                            else output.write(f"[xiaoming] {msg.message}") if isinstance(msg, ProgressEvent)
+                            else output.write(f"[xiaoming] {msg}")
+                        ),
+                        should_cancel=cancel_event.is_set if cancel_event else None,
+                    )
+                    if answer:
+                        output.write(answer)
+                finally:
+                    runtime.active_checkpoint_id = None
+        except Exception as exc:
+            if runtime is not None:
+                runtime.logger.error("cli_turn_exception", exc=exc, user_input=user_input)
+            output.write(f"Error: {exc}")
+
+    threading.Thread(target=_agent_worker, daemon=True).start()
+    return None
+
+
+def run_loop_with_progress(loop, task: str, session: Session | None, should_cancel: Callable[[], bool] | None = None, on_event=None) -> str:
+    signature = inspect.signature(loop.run)
+    kwargs = {"session": session}
+    if "on_event" in signature.parameters:
+        kwargs["on_event"] = on_event or (lambda msg: None)
+    if "should_cancel" in signature.parameters:
+        kwargs["should_cancel"] = should_cancel
+    return loop.run(task, **kwargs)
 
 
 def _handle_config_command(runtime: ChatRuntime, user_input: str) -> bool:
@@ -1459,7 +1425,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.task is None or args.task == "chat":
         return run_chat(ChatRuntime(Path.cwd(), args))
     loop = build_loop(Path.cwd(), args)
-    _print_answer(run_loop_with_progress(loop, args.task, session=None))
+    answer = run_loop_with_progress(loop, args.task, session=None)
+    if answer:
+        print(answer)
     return 0
 
 
