@@ -12,8 +12,9 @@ from typing import Callable
 
 from prompt_toolkit import Application
 from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.buffer import Buffer
 from prompt_toolkit.layout import HSplit, Layout, Window
-from prompt_toolkit.layout.controls import FormattedTextControl
+from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl
 from prompt_toolkit.styles import Style
 from prompt_toolkit.widgets import TextArea
 
@@ -835,22 +836,12 @@ def run_chat(runtime_or_loop) -> int:
     output = TuiOutput()
     cancel_event = threading.Event()
 
-    def _on_progress(message: str | ProgressEvent) -> None:
-        if isinstance(message, ProgressEvent):
-            if message.kind == "text_delta":
-                output.write(message.message, end="")
-                return
-            output.write(f"[xiaoming] {message.message}")
-            return
-        output.write(f"[xiaoming] {message}")
-
     # --- Build prompt_toolkit UI ---
-    output_area = TextArea(
-        text="\n".join(startup_lines),
-        read_only=True,
-        scrollbar=True,
-        focusable=False,
-    )
+    output_buffer = Buffer(read_only=False)
+    output_buffer.text = "\n".join(startup_lines)
+    output_control = BufferControl(buffer=output_buffer, focusable=False)
+    output_window = Window(content=output_control)
+
     input_area = TextArea(
         text="",
         prompt="xiaoming> ",
@@ -860,30 +851,17 @@ def run_chat(runtime_or_loop) -> int:
     )
 
     root_container = HSplit([
-        output_area,
+        output_window,
         Window(height=1, char="─", style="class:separator"),
         input_area,
     ])
 
     kb = KeyBindings()
 
-    @kb.add("enter")
-    def _(event):
-        user_input = input_area.text.strip()
-        if not user_input:
-            return
-        input_area.text = ""
-
-        result = _handle_input(user_input, runtime, session, loop,
-                               output, cancel_event if runtime is not None else None,
-                               async_notices)
-        if result == "exit":
-            event.app.exit()
-
     @kb.add("c-c")
     def _(event):
         if runtime is not None and runtime.async_coordinator is not None:
-            output.write(runtime.async_coordinator.cancel_current())
+            emit(runtime.async_coordinator.cancel_current())
         else:
             cancel_event.set()
 
@@ -896,21 +874,81 @@ def run_chat(runtime_or_loop) -> int:
         full_screen=True,
     )
 
+    def _emit(text: str, end: str = "\n") -> None:
+        """Write to output buffer and trigger UI refresh. Thread-safe."""
+        output.write(text, end=end)
+        app.invalidate()
+
     def _refresh_ui():
         new_text = output.flush()
         if new_text:
-            current = output_area.buffer.text
-            output_area.buffer.text = (current + "\n" + new_text) if current else new_text
-            output_area.buffer.cursor_position = len(output_area.buffer.text)
+            current = output_buffer.text
+            output_buffer.text = (current + "\n" + new_text) if current else new_text
+            output_buffer.cursor_position = len(output_buffer.text)
         notices = async_notices.pull()
         for notice in notices:
-            current = output_area.buffer.text
-            output_area.buffer.text = current + f"\n[xiaoming] {notice.message}"
+            current = output_buffer.text
+            output_buffer.text = current + f"\n[xiaoming] {notice.message}"
 
     def _before_render(_app):
         _refresh_ui()
 
     app.before_render += _before_render
+
+    def _on_progress_emit(message: str | ProgressEvent) -> None:
+        if isinstance(message, ProgressEvent):
+            if message.kind == "text_delta":
+                _emit(message.message, end="")
+                return
+            _emit(f"[xiaoming] {message.message}")
+            return
+        _emit(f"[xiaoming] {message}")
+
+    def _run_agent_task(user_input: str):
+        """Run agent in a daemon thread, emitting output via _on_progress_emit."""
+        def _agent_worker():
+            try:
+                if runtime is None:
+                    answer = run_loop_with_progress(
+                        loop, user_input, session=session,
+                        on_event=_on_progress_emit,
+                    )
+                    if answer:
+                        _emit(answer)
+                    return
+                cancel_event.clear()
+                checkpoint = runtime.checkpoint_store.create(runtime.session.session_id, user_input)
+                runtime.active_checkpoint_id = checkpoint.id
+                try:
+                    answer = run_loop_with_progress(
+                        runtime.loop, user_input,
+                        session=session,
+                        on_event=_on_progress_emit,
+                        should_cancel=cancel_event.is_set,
+                    )
+                    if answer:
+                        _emit(answer)
+                finally:
+                    runtime.active_checkpoint_id = None
+            except Exception as exc:
+                if runtime is not None:
+                    runtime.logger.error("cli_turn_exception", exc=exc, user_input=user_input)
+                _emit(f"Error: {exc}")
+        threading.Thread(target=_agent_worker, daemon=True).start()
+
+    # Update the enter key binding to pass _emit
+    @kb.add("enter")
+    def _(event):
+        user_input = input_area.text.strip()
+        if not user_input:
+            return
+        input_area.text = ""
+        result = _handle_input(user_input, runtime, session, loop,
+                               output, _emit, _run_agent_task,
+                               cancel_event if runtime is not None else None,
+                               async_notices)
+        if result == "exit":
+            event.app.exit()
 
     try:
         app.run()
@@ -1000,6 +1038,8 @@ class AsyncNoticeBuffer:
 
 
 def _handle_input(user_input: str, runtime, session, loop, output: TuiOutput,
+                  emit: Callable[[str, str], None],
+                  run_agent_task: Callable[[str], None],
                   cancel_event: threading.Event | None,
                   async_notices) -> str | None:
     """Handle one line of user input. Returns 'exit' if the app should quit."""
@@ -1020,113 +1060,113 @@ def _handle_input(user_input: str, runtime, session, loop, output: TuiOutput,
 
     if user_input == "/status":
         if runtime is None:
-            output.write(f"Session items: {session.item_count}")
+            emit(f"Session items: {session.item_count}")
         elif runtime.async_coordinator is not None:
-            output.write(runtime.status_text())
-            output.write(runtime.async_coordinator.status_text())
+            emit(runtime.status_text())
+            emit(runtime.async_coordinator.status_text())
         else:
-            output.write(runtime.status_text())
+            emit(runtime.status_text())
         return None
 
     if user_input == "/context":
         if runtime is None:
-            output.write(f"Session items: {session.item_count}")
+            emit(f"Session items: {session.item_count}")
         else:
-            output.write(runtime.context_text())
+            emit(runtime.context_text())
         return None
 
     if user_input == "/compact":
         if runtime is None:
-            output.write("Context compaction is only available in xiaoming-cli runtime mode.")
+            emit("Context compaction is only available in xiaoming-cli runtime mode.")
         else:
             try:
-                output.write(runtime.compact_context())
+                emit(runtime.compact_context())
             except Exception as exc:
                 runtime.logger.error("manual_context_compaction_failed", exc=exc)
-                output.write(f"Context compaction failed: {exc}")
+                emit(f"Context compaction failed: {exc}")
         return None
 
     if user_input == "/dream":
         if runtime is None:
-            output.write("Dream mode is only available in xiaoming-cli runtime mode.")
+            emit("Dream mode is only available in xiaoming-cli runtime mode.")
         else:
             try:
-                output.write(runtime.dream_context())
+                emit(runtime.dream_context())
             except Exception as exc:
                 runtime.logger.error("manual_dream_failed", exc=exc)
-                output.write(f"Dream failed: {exc}")
+                emit(f"Dream failed: {exc}")
         return None
 
     if user_input == "/tasks":
         if runtime is None or runtime.async_coordinator is None:
-            output.write("Async tasks are only available in xiaoming-cli async runtime mode.")
+            emit("Async tasks are only available in xiaoming-cli async runtime mode.")
         else:
-            output.write(runtime.async_coordinator.tasks_text())
+            emit(runtime.async_coordinator.tasks_text())
         return None
 
     if user_input.startswith("/talk"):
         if runtime is None or runtime.async_coordinator is None:
-            output.write("Peer talk is only available in xiaoming-cli async runtime mode.")
+            emit("Peer talk is only available in xiaoming-cli async runtime mode.")
         else:
             parts = user_input.split(maxsplit=2)
             if len(parts) < 3:
-                output.write("Usage: /talk <peer-id> <message>")
+                emit("Usage: /talk <peer-id> <message>")
             else:
-                output.write(runtime.talk_to_peer(parts[1], parts[2]))
+                emit(runtime.talk_to_peer(parts[1], parts[2]))
         return None
 
     if user_input == "/quiet":
         if runtime is not None and runtime.async_coordinator is not None:
             runtime.async_coordinator.set_quiet(True)
-            output.write("Background notices reduced.")
+            emit("Background notices reduced.")
         else:
-            output.write("Quiet mode is only available in xiaoming-cli async runtime mode.")
+            emit("Quiet mode is only available in xiaoming-cli async runtime mode.")
         return None
 
     if user_input == "/verbose":
         if runtime is not None and runtime.async_coordinator is not None:
             runtime.async_coordinator.set_quiet(False)
-            output.write("Background notices restored.")
+            emit("Background notices restored.")
         else:
-            output.write("Verbose mode is only available in xiaoming-cli async runtime mode.")
+            emit("Verbose mode is only available in xiaoming-cli async runtime mode.")
         return None
 
     if user_input.startswith("/cancel"):
         if runtime is None or runtime.async_coordinator is None:
-            output.write("Cancel is only available in xiaoming-cli async runtime mode.")
+            emit("Cancel is only available in xiaoming-cli async runtime mode.")
         elif user_input == "/cancel all":
-            output.write(runtime.async_coordinator.cancel_all())
+            emit(runtime.async_coordinator.cancel_all())
         else:
-            output.write(runtime.async_coordinator.cancel_current())
+            emit(runtime.async_coordinator.cancel_current())
         return None
 
     if user_input == "/session":
         if runtime is None:
-            output.write(f"Session items: {session.item_count}")
+            emit(f"Session items: {session.item_count}")
         else:
-            output.write(runtime.session_text())
+            emit(runtime.session_text())
         return None
 
     if user_input == "/sessions":
         if runtime is None:
-            output.write("Sessions are only available in xiaoming-cli runtime mode.")
+            emit("Sessions are only available in xiaoming-cli runtime mode.")
         else:
-            output.write(runtime.sessions_text())
+            emit(runtime.sessions_text())
         return None
 
     if user_input == "/checkpoints":
         if runtime is None:
-            output.write("Checkpoints are only available in xiaoming-cli runtime mode.")
+            emit("Checkpoints are only available in xiaoming-cli runtime mode.")
         else:
-            output.write(runtime.checkpoints_text())
+            emit(runtime.checkpoints_text())
         return None
 
     if user_input.startswith("/rewind"):
         if runtime is None:
-            output.write("Checkpoints are only available in xiaoming-cli runtime mode.")
+            emit("Checkpoints are only available in xiaoming-cli runtime mode.")
         else:
             parts = user_input.split()
-            output.write(runtime.restore_checkpoint(parts[1] if len(parts) > 1 else None))
+            emit(runtime.restore_checkpoint(parts[1] if len(parts) > 1 else None))
         return None
 
     if user_input == "/new":
@@ -1139,16 +1179,16 @@ def _handle_input(user_input: str, runtime, session, loop, output: TuiOutput,
 
     if user_input == "/skills":
         if runtime is None:
-            output.write("Skills are only available in xiaoming-cli runtime mode.")
+            emit("Skills are only available in xiaoming-cli runtime mode.")
         else:
-            output.write(runtime.skills_text())
+            emit(runtime.skills_text())
         return None
 
     if user_input == "/logs":
         if runtime is None:
-            output.write("Logs are only available in xiaoming-cli runtime mode.")
+            emit("Logs are only available in xiaoming-cli runtime mode.")
         else:
-            output.write(str(runtime.logger.path))
+            emit(str(runtime.logger.path))
         return None
 
     if runtime is not None and _handle_skill_command(runtime, user_input):
@@ -1158,44 +1198,7 @@ def _handle_input(user_input: str, runtime, session, loop, output: TuiOutput,
         return None
 
     # Run agent in background thread
-    def _agent_worker():
-        try:
-            if cancel_event is not None:
-                cancel_event.clear()
-            if runtime is None:
-                answer = run_loop_with_progress(
-                    loop, user_input, session=session,
-                    on_event=lambda msg: (
-                        output.write(msg.message, end="") if isinstance(msg, ProgressEvent) and msg.kind == "text_delta"
-                        else output.write(f"[xiaoming] {msg.message}") if isinstance(msg, ProgressEvent)
-                        else output.write(f"[xiaoming] {msg}")
-                    ))
-                if answer:
-                    output.write(answer)
-            else:
-                checkpoint = runtime.checkpoint_store.create(runtime.session.session_id, user_input)
-                runtime.active_checkpoint_id = checkpoint.id
-                try:
-                    answer = run_loop_with_progress(
-                        runtime.loop, user_input,
-                        session=runtime.session,
-                        on_event=lambda msg: (
-                            output.write(msg.message, end="") if isinstance(msg, ProgressEvent) and msg.kind == "text_delta"
-                            else output.write(f"[xiaoming] {msg.message}") if isinstance(msg, ProgressEvent)
-                            else output.write(f"[xiaoming] {msg}")
-                        ),
-                        should_cancel=cancel_event.is_set if cancel_event else None,
-                    )
-                    if answer:
-                        output.write(answer)
-                finally:
-                    runtime.active_checkpoint_id = None
-        except Exception as exc:
-            if runtime is not None:
-                runtime.logger.error("cli_turn_exception", exc=exc, user_input=user_input)
-            output.write(f"Error: {exc}")
-
-    threading.Thread(target=_agent_worker, daemon=True).start()
+    run_agent_task(user_input)
     return None
 
 
