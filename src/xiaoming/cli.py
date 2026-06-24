@@ -1036,21 +1036,44 @@ def run_loop_with_progress(loop, task: str, session: Session | None, should_canc
 
 def _print_answer(answer: str) -> None:
     if answer:
-        print(answer)
+        _safe_print(answer)
 
 
 def _print_progress(message: str | ProgressEvent) -> None:
     if isinstance(message, ProgressEvent):
         if message.kind == "text_delta":
-            print(message.message, end=message.end, flush=True)
+            _safe_print(message.message, end=message.end)
             return
-        print(f"[xiaoming] {message.message}", flush=True)
+        _safe_print(f"[xiaoming] {message.message}")
         return
-    print(f"[xiaoming] {message}", flush=True)
+    _safe_print(f"[xiaoming] {message}")
 
 
 def _print_async_notice(notice: CoordinatorNotice) -> None:
-    print(f"\n[xiaoming] {notice.message}", flush=True)
+    _safe_print(f"[xiaoming] {notice.message}", prefix="\n")
+
+
+def _safe_print(text: str, end: str = "\n", prefix: str = "") -> None:
+    """Print output without disrupting the readline input prompt.
+
+    When readline callback mode is active and the user is typing, this
+    saves the current input buffer, clears the prompt line, prints the
+    output, then redraws the prompt with the saved input.
+    """
+    if not sys.stdin.isatty():
+        sys.stdout.write(f"{prefix}{text}{end}")
+        sys.stdout.flush()
+        return
+    try:
+        import readline
+        saved = readline.get_line_buffer()
+        sys.stdout.write(f"\r\033[K{prefix}{text}{end}")
+        if saved:
+            sys.stdout.write(f"xiaoming> {saved}")
+        sys.stdout.flush()
+    except Exception:
+        sys.stdout.write(f"{prefix}{text}{end}")
+        sys.stdout.flush()
 
 
 def _read_user_input(prompt: str, async_notices: "AsyncNoticeBuffer") -> str:
