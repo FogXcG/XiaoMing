@@ -11,7 +11,6 @@ from pathlib import Path
 from typing import Callable
 
 from prompt_toolkit import Application
-from prompt_toolkit.buffer import Buffer
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.layout import HSplit, Layout, Window
 from prompt_toolkit.layout.controls import FormattedTextControl
@@ -819,6 +818,8 @@ def run_chat(runtime_or_loop) -> int:
     if isinstance(runtime_or_loop, ChatRuntime):
         runtime = runtime_or_loop
         runtime.async_notice_handler = async_notices.enqueue
+        session = runtime.session
+        loop = runtime.loop
     else:
         runtime = None
         loop = runtime_or_loop
@@ -850,9 +851,8 @@ def run_chat(runtime_or_loop) -> int:
         scrollbar=True,
         focusable=False,
     )
-    input_buffer = Buffer(multiline=False)
     input_area = TextArea(
-        buffer=input_buffer,
+        text="",
         prompt="xiaoming> ",
         multiline=False,
         height=1,
@@ -869,10 +869,10 @@ def run_chat(runtime_or_loop) -> int:
 
     @kb.add("enter")
     def _(event):
-        user_input = input_buffer.text.strip()
+        user_input = input_area.text.strip()
         if not user_input:
             return
-        input_buffer.text = ""
+        input_area.text = ""
 
         result = _handle_input(user_input, runtime, session, loop,
                                output, cancel_event if runtime is not None else None,
