@@ -797,9 +797,10 @@ class TuiOutput:
                 self._streaming += text
             else:
                 if self._streaming:
-                    self._lines.append(self._streaming)
+                    self._lines.append(self._streaming + text)
                     self._streaming = ""
-                self._lines.append(text)
+                else:
+                    self._lines.append(text)
 
     def flush(self) -> str:
         with self._lock:
