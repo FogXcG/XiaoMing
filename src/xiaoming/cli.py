@@ -803,13 +803,16 @@ class TuiOutput:
                     self._lines.append(text)
 
     def flush(self) -> str:
+        """Return completed lines without touching streaming buffer."""
         with self._lock:
-            if self._streaming:
-                self._lines.append(self._streaming)
-                self._streaming = ""
             lines = self._lines[:]
             self._lines.clear()
-            return "\n".join(lines)
+            return "\n".join(lines) if lines else ""
+
+    def peek_streaming(self) -> str:
+        """Return current streaming text without clearing it."""
+        with self._lock:
+            return self._streaming
 
 
 
@@ -885,16 +888,32 @@ def run_chat(runtime_or_loop) -> int:
         except Exception:
             pass
 
+    _streaming_pos = -1  # position in output_buffer where streaming text starts
+
     def _refresh_ui():
-        new_text = output.flush()
-        if new_text:
-            current = output_buffer.text
-            output_buffer.text = (current + "\n" + new_text) if current else new_text
+        nonlocal _streaming_pos
+        completed = output.flush()
+        streaming = output.peek_streaming()
+
+        if completed:
+            _streaming_pos = -1
+            output_buffer.text = (output_buffer.text + "\n" + completed) if output_buffer.text else completed
             output_buffer.cursor_position = len(output_buffer.text)
+
+        if streaming:
+            if _streaming_pos >= 0:
+                # Update streaming text in-place
+                output_buffer.text = output_buffer.text[:_streaming_pos] + streaming
+            else:
+                # First streaming chunk — append
+                _streaming_pos = len(output_buffer.text) + 1  # +1 for \n
+                output_buffer.text += "\n" + streaming
+            output_buffer.cursor_position = len(output_buffer.text)
+
         notices = async_notices.pull()
         for notice in notices:
-            current = output_buffer.text
-            output_buffer.text = current + f"\n[xiaoming] {notice.message}"
+            _streaming_pos = -1
+            output_buffer.text += f"\n[xiaoming] {notice.message}"
 
     def _before_render(_app):
         _refresh_ui()
@@ -969,7 +988,7 @@ def run_chat(runtime_or_loop) -> int:
         if not user_input:
             return
         input_area.text = ""
-        output.write(user_input)
+        output.write(f">>> {user_input}")
         _invalidate_ui()
         result = _handle_input(user_input, runtime, session, loop,
                                output, _emit, _run_agent_task,
