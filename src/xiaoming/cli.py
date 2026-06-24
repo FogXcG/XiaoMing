@@ -1060,9 +1060,9 @@ def _print_async_notice(notice: CoordinatorNotice) -> None:
 def _safe_print(text: str, end: str = "\n", prefix: str = "") -> None:
     """Print output without disrupting the readline input prompt.
 
-    When readline callback mode is active and the user is typing, this
-    saves the current input buffer, clears the prompt line, prints the
-    output, then redraws the prompt with the saved input.
+    When readline callback mode is active, this saves the current input buffer,
+    clears the prompt area, prints the output, then redraws the prompt and
+    tells readline to refresh its display.
     """
     if not sys.stdin.isatty():
         sys.stdout.write(f"{prefix}{text}{end}")
@@ -1071,10 +1071,12 @@ def _safe_print(text: str, end: str = "\n", prefix: str = "") -> None:
     try:
         import readline
         saved = readline.get_line_buffer()
-        sys.stdout.write(f"\r\033[K{prefix}{text}{end}")
-        if saved:
-            sys.stdout.write(f"xiaoming> {saved}")
+        # \r -> column 0, \033[0J -> clear cursor to end of screen
+        sys.stdout.write(f"\r\033[0J{prefix}{text}{end}")
+        # Always redraw the prompt line at the bottom
+        sys.stdout.write(f"xiaoming> {saved}")
         sys.stdout.flush()
+        readline.redisplay()
     except Exception:
         sys.stdout.write(f"{prefix}{text}{end}")
         sys.stdout.flush()
