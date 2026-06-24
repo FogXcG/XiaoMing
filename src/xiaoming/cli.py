@@ -178,18 +178,8 @@ def tool_capability_hook(profile: CapabilityProfile) -> Callable[[dict], dict | 
     def hook(payload: dict) -> dict | None:
         normalized = _resolve_capability_profile(profile)
         tool = str(payload.get("tool") or "")
-        if normalized == "foreground":
+        if normalized == "foreground" or normalized == "orchestrator":
             return None
-        if normalized == "orchestrator":
-            if tool in ORCHESTRATOR_ALLOWED_TOOLS:
-                return None
-            return {
-                "decision": "deny",
-                "reason": (
-                    "Primary coordinator cannot execute workspace, shell, skill, or worker-only tools directly. "
-                    "Answer simple questions directly, use web_search for current public information, or call schedule_background_task for file-changing or long-running work."
-                ),
-            }
         if normalized in {"read_only", "verify"}:
             if tool in READ_ONLY_ALLOWED_TOOLS:
                 return None
@@ -766,8 +756,9 @@ In this runtime, act as the user's primary conversation partner and task coordin
 
 Rules:
 - Answer simple questions directly.
-- In normal interactive chat, stay in the coordinator role. Do not inspect or modify workspace files directly.
+- Handle lightweight tasks yourself — inspect files, make small edits, run quick commands, load skills. You have full tool access.
 - For independent, large, long-running, multi-file, dependency/setup, skill installation, repository cloning, or otherwise substantial work, briefly tell the user it will run in the background and call schedule_background_task.
+- Use your judgment: a single-file edit or a quick search is fine to do inline; a multi-step refactor or a new feature should go to a background worker.
 - Once you decide to schedule background work, call schedule_background_task immediately. Let the worker inspect files, run commands, and choose implementation details.
 - Do not claim that background work is complete until background task status or notices say so.
 - If a foreground task is interrupted by a new user message, the runtime may move the original task to a background worker. Continue handling the new user message normally.
