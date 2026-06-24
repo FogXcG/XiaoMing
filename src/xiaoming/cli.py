@@ -875,9 +875,15 @@ def run_chat(runtime_or_loop) -> int:
     )
 
     def _emit(text: str, end: str = "\n") -> None:
-        """Write to output buffer and trigger UI refresh. Thread-safe."""
+        """Write to output buffer (thread-safe). UI refresh via periodic timer."""
         output.write(text, end=end)
-        app.invalidate()
+
+    def _invalidate_ui() -> None:
+        """Schedule a UI refresh. Called from agent thread after output."""
+        try:
+            app.invalidate()
+        except Exception:
+            pass
 
     def _refresh_ui():
         new_text = output.flush()
@@ -898,11 +904,15 @@ def run_chat(runtime_or_loop) -> int:
     def _on_progress_emit(message: str | ProgressEvent) -> None:
         if isinstance(message, ProgressEvent):
             if message.kind == "text_delta":
-                _emit(message.message, end="")
+                # Streaming deltas: write to buffer only, don't invalidate
+                # on every character — periodic timer handles refresh.
+                output.write(message.message, end="")
                 return
-            _emit(f"[xiaoming] {message.message}")
+            output.write(f"[xiaoming] {message.message}")
+            _invalidate_ui()
             return
-        _emit(f"[xiaoming] {message}")
+        output.write(f"[xiaoming] {message}")
+        _invalidate_ui()
 
     def _run_agent_task(user_input: str):
         """Run agent in a daemon thread, emitting output via _on_progress_emit."""
@@ -915,6 +925,7 @@ def run_chat(runtime_or_loop) -> int:
                     )
                     if answer:
                         _emit(answer)
+                        _invalidate_ui()
                     return
                 cancel_event.clear()
                 checkpoint = runtime.checkpoint_store.create(runtime.session.session_id, user_input)
@@ -928,26 +939,44 @@ def run_chat(runtime_or_loop) -> int:
                     )
                     if answer:
                         _emit(answer)
+                        _invalidate_ui()
                 finally:
                     runtime.active_checkpoint_id = None
             except Exception as exc:
                 if runtime is not None:
                     runtime.logger.error("cli_turn_exception", exc=exc, user_input=user_input)
                 _emit(f"Error: {exc}")
+                _invalidate_ui()
         threading.Thread(target=_agent_worker, daemon=True).start()
 
-    # Update the enter key binding to pass _emit
+    # Periodic refresh: keep UI alive during streaming
+    _stop_refresh = threading.Event()
+
+    def _periodic_invalidate():
+        while not _stop_refresh.is_set():
+            _stop_refresh.wait(0.1)
+            try:
+                app.invalidate()
+            except Exception:
+                pass
+
+    threading.Thread(target=_periodic_invalidate, daemon=True).start()
+
+    # Enter key: echo input + run agent
     @kb.add("enter")
     def _(event):
         user_input = input_area.text.strip()
         if not user_input:
             return
         input_area.text = ""
+        output.write(user_input)
+        _invalidate_ui()
         result = _handle_input(user_input, runtime, session, loop,
                                output, _emit, _run_agent_task,
                                cancel_event if runtime is not None else None,
                                async_notices)
         if result == "exit":
+            _stop_refresh.set()
             event.app.exit()
 
     try:
