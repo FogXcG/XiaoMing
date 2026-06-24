@@ -1058,13 +1058,9 @@ _delta_buf = ""
 def _safe_print(text: str, end: str = "\n", prefix: str = "") -> None:
     """Print output without disrupting the readline input prompt.
 
-    When readline callback mode is active, this saves the current input buffer,
-    clears the prompt area, prints the output, then redraws the prompt and
-    tells readline to refresh its display.
-
-    Streaming text (end="") accumulates in a buffer so the growing text is
-    redrawn above the prompt on each delta, rather than writing directly at
-    the cursor position.
+    Clears the terminal area below the cursor, prints the output, then
+    redraws the prompt line at the bottom and tells readline to refresh.
+    Streaming text (end="") accumulates in a buffer.
     """
     global _delta_buf
     if not sys.stdin.isatty():
@@ -1073,14 +1069,13 @@ def _safe_print(text: str, end: str = "\n", prefix: str = "") -> None:
         return
     try:
         import readline
-        saved = readline.get_line_buffer()
         if end == "":
             _delta_buf += text
             sys.stdout.write(f"\r\033[0J{prefix}{_delta_buf}")
         else:
             _delta_buf = ""
             sys.stdout.write(f"\r\033[0J{prefix}{text}{end}")
-        sys.stdout.write(f"xiaoming> {saved}")
+        sys.stdout.write("xiaoming> ")
         sys.stdout.flush()
         readline.redisplay()
     except Exception:
