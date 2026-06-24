@@ -1042,11 +1042,7 @@ def _print_answer(answer: str) -> None:
 def _print_progress(message: str | ProgressEvent) -> None:
     if isinstance(message, ProgressEvent):
         if message.kind == "text_delta":
-            # Stream deltas directly — they build up on the current line
-            # and should not trigger prompt save/restore on each character.
-            sys.stdout.write(message.message)
-            sys.stdout.write(message.end)
-            sys.stdout.flush()
+            _safe_print(message.message, end="")
             return
         _safe_print(f"[xiaoming] {message.message}")
         return
@@ -1054,8 +1050,10 @@ def _print_progress(message: str | ProgressEvent) -> None:
 
 
 def _print_async_notice(notice: CoordinatorNotice) -> None:
-    _safe_print(f"[xiaoming] {notice.message}", prefix="\n")
+    _safe_print(f"[xiaoming] {notice.message}")
 
+
+_delta_buf = ""
 
 def _safe_print(text: str, end: str = "\n", prefix: str = "") -> None:
     """Print output without disrupting the readline input prompt.
@@ -1063,7 +1061,12 @@ def _safe_print(text: str, end: str = "\n", prefix: str = "") -> None:
     When readline callback mode is active, this saves the current input buffer,
     clears the prompt area, prints the output, then redraws the prompt and
     tells readline to refresh its display.
+
+    Streaming text (end="") accumulates in a buffer so the growing text is
+    redrawn above the prompt on each delta, rather than writing directly at
+    the cursor position.
     """
+    global _delta_buf
     if not sys.stdin.isatty():
         sys.stdout.write(f"{prefix}{text}{end}")
         sys.stdout.flush()
@@ -1071,9 +1074,12 @@ def _safe_print(text: str, end: str = "\n", prefix: str = "") -> None:
     try:
         import readline
         saved = readline.get_line_buffer()
-        # \r -> column 0, \033[0J -> clear cursor to end of screen
-        sys.stdout.write(f"\r\033[0J{prefix}{text}{end}")
-        # Always redraw the prompt line at the bottom
+        if end == "":
+            _delta_buf += text
+            sys.stdout.write(f"\r\033[0J{prefix}{_delta_buf}")
+        else:
+            _delta_buf = ""
+            sys.stdout.write(f"\r\033[0J{prefix}{text}{end}")
         sys.stdout.write(f"xiaoming> {saved}")
         sys.stdout.flush()
         readline.redisplay()
