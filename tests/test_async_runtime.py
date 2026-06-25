@@ -79,6 +79,25 @@ def test_schedule_background_task_accepts_plain_message():
     assert coordinator.task_spec.skills_to_preload == []
 
 
+def test_schedule_background_task_rejects_nested_schedule_from_promoted_foreground():
+    class FakeCoordinator:
+        def __init__(self):
+            self.called = False
+
+        def schedule_background_task(self, task_spec):
+            self.called = True
+            return ToolResult("schedule_background_task", "success", output="unexpected")
+
+    coordinator = FakeCoordinator()
+    tool = ScheduleBackgroundTaskTool(lambda: coordinator, promoted_task_getter=lambda: "task-123")
+
+    result = tool.run({"message": "继续安装 superpowers skill", "task_name": "安装 skill"})
+
+    assert result.status == "denied"
+    assert coordinator.called is False
+    assert "already running as a background task" in result.error
+
+
 def test_schedule_background_task_preserves_codex_request_from_turn_context():
     class FakeCoordinator:
         def __init__(self):

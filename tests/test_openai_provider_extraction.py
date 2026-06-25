@@ -1,7 +1,7 @@
 from types import SimpleNamespace
 
-from xiaoming.llm.openai_provider import extract_response, extract_response_with_tools
-from xiaoming.llm.types import ToolSpec
+from xiaoming.llm.openai_provider import OpenAIProvider, extract_response, extract_response_with_tools
+from xiaoming.llm.types import LLMRequest, ToolSpec
 
 
 def test_extract_response_reads_function_call_and_plain_output_items():
@@ -89,3 +89,41 @@ def test_extract_response_reads_custom_tool_call_as_freeform_argument():
     assert response.tool_calls[0].name == "apply_patch"
     assert response.tool_calls[0].args == {"patch": "*** Begin Patch\n*** End Patch"}
     assert response.tool_calls[0].output_type == "custom_tool_call_output"
+
+
+def test_openai_provider_enables_parallel_tool_calls(monkeypatch):
+    captured = {}
+
+    class FakeResponses:
+        def create(self, **kwargs):
+            captured.update(kwargs)
+            return SimpleNamespace(output_text="Done.", output=[])
+
+    class FakeOpenAI:
+        def __init__(self, **kwargs):
+            pass
+
+        responses = FakeResponses()
+
+    monkeypatch.setattr("xiaoming.llm.openai_provider.OpenAI", FakeOpenAI)
+
+    provider = OpenAIProvider(api_key="test")
+    response = provider.complete(
+        LLMRequest(
+            instructions="rules",
+            input_items=[{"role": "user", "content": "search twice"}],
+            tools=[
+                ToolSpec(
+                    name="web_search",
+                    description="Search web.",
+                    input_schema={"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"], "additionalProperties": False},
+                )
+            ],
+            model="gpt-5",
+            temperature=0.2,
+            max_output_tokens=128,
+        )
+    )
+
+    assert response.message == "Done."
+    assert captured["parallel_tool_calls"] is True

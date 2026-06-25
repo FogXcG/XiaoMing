@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import copy
 import inspect
 import os
 import sys
@@ -11,10 +12,12 @@ from pathlib import Path
 from typing import Callable
 
 from prompt_toolkit import Application
-from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.buffer import Buffer
-from prompt_toolkit.layout import HSplit, Layout, Window
+from prompt_toolkit.completion import Completer, Completion
+from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.layout import Float, FloatContainer, HSplit, Layout, Window
 from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl
+from prompt_toolkit.layout.menus import CompletionsMenu
 from prompt_toolkit.styles import Style
 from prompt_toolkit.widgets import TextArea
 
@@ -28,7 +31,7 @@ from xiaoming.async_runtime.tasks import TaskSpec
 from xiaoming.agent_loop import AgentLoop
 from xiaoming.bootstrap import discover_bootstrap_contexts
 from xiaoming.checkpoints import CheckpointStore
-from xiaoming.config import load_config
+from xiaoming.config import DEFAULT_DEEPSEEK_MODEL, DEFAULT_OPENAI_MODEL, api_key_env_name, api_key_present, global_config_path, load_config, save_global_config, secrets_env_path, workspace_config_path, write_secrets_env
 from xiaoming.hook_config import load_workspace_hooks
 from xiaoming.hooks import HookManager
 from xiaoming.llm.deepseek_provider import DeepSeekProvider
@@ -42,6 +45,7 @@ from xiaoming.session import Session
 from xiaoming.sessions import SessionRecord, SessionStore, rehydrate_session
 from xiaoming.skill_installer import SkillInstallError, install_skill_from_url
 from xiaoming.skills import SkillLibrary
+from xiaoming.time_meta import now_iso
 from xiaoming.tools.apply_patch import ApplyPatchTool
 from xiaoming.tools.append_file import AppendFileTool
 from xiaoming.tools.background_task import BackgroundTasksStatusTool, CancelBackgroundTaskTool, FollowBackgroundTaskTool, ReplyMailboxMessageTool, ScheduleBackgroundTaskTool, TalkToPeerTool
@@ -108,6 +112,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     stream_group = parser.add_mutually_exclusive_group()
     stream_group.add_argument("--stream", dest="stream", action="store_true", default=None)
     stream_group.add_argument("--no-stream", dest="stream", action="store_false")
+    parser.add_argument("--init", dest="init", action="store_true", default=False)
     return parser.parse_args(argv)
 
 
@@ -148,11 +153,23 @@ CapabilityProfile = str | Callable[[], str]
 
 
 @dataclass
+class SessionSnapshot:
+    input_items: list[dict]
+    loaded_skills: dict
+    bootstrap_contexts: dict
+    base_instructions: str | None = None
+    reference_turn_context: object | None = None
+
+
+@dataclass
 class ForegroundTask:
     task_name: str
     original_message: str
     status: str = "running"
     worker_id: str | None = None
+    session_id: str | None = None
+    boundary_snapshot: SessionSnapshot | None = None
+    cancel_event: threading.Event | None = None
 
 
 @dataclass
@@ -161,13 +178,77 @@ class ForegroundTurnResult:
     pending_user_input: str | None = None
 
 
+@dataclass
+class _TuiApprovalRequest:
+    action: str
+    done: threading.Event
+    approved: bool | None = None
+
+
+class TuiApprovalController:
+    """Route tool approvals through the prompt_toolkit input area."""
+
+    def __init__(self, output: "TuiOutput", invalidate: Callable[[], None]):
+        self.output = output
+        self.invalidate = invalidate
+        self._lock = threading.Lock()
+        self._pending: _TuiApprovalRequest | None = None
+
+    def request(self, action: str) -> bool:
+        request = _TuiApprovalRequest(action=action, done=threading.Event())
+        with self._lock:
+            if self._pending is not None:
+                return False
+            self._pending = request
+        self.output.write(_format_tui_approval_action(action))
+        self.output.write("Approve? [y/N]")
+        self.invalidate()
+        request.done.wait()
+        return bool(request.approved)
+
+    def consume_answer(self, answer: str) -> bool | None:
+        with self._lock:
+            request = self._pending
+            if request is None:
+                return None
+            self._pending = None
+        approved = answer.strip().lower() in {"y", "yes"}
+        request.approved = approved
+        request.done.set()
+        return approved
+
+    def has_pending(self) -> bool:
+        with self._lock:
+            return self._pending is not None
+
+
+def _format_tui_approval_action(action: str, max_chars: int = 1200, max_lines: int = 30) -> str:
+    compacted = _omit_content_preview(action)
+    lines = compacted.splitlines()
+    if len(lines) > max_lines:
+        lines = lines[:max_lines] + [f"... omitted {len(lines) - max_lines} lines ..."]
+        compacted = "\n".join(lines)
+    if len(compacted) > max_chars:
+        compacted = compacted[:max_chars].rstrip() + "\n... omitted long approval details ..."
+    return compacted
+
+
+def _omit_content_preview(action: str) -> str:
+    marker = "Content preview:"
+    if marker not in action:
+        return action
+    head = action.split(marker, 1)[0].rstrip()
+    return f"{head}\nContent preview: [omitted in TUI; approve only if the file path and operation are expected]"
+
+
 def build_universal_runtime_tools(
     coordinator_getter: Callable[[], object | None],
     talk_callback: TalkCallback,
     turn_context_getter: Callable[[], str] | None = None,
+    promoted_task_getter: Callable[[], str] | None = None,
 ) -> list[Tool]:
     return [
-        ScheduleBackgroundTaskTool(coordinator_getter, turn_context_getter=turn_context_getter),
+        ScheduleBackgroundTaskTool(coordinator_getter, turn_context_getter=turn_context_getter, promoted_task_getter=promoted_task_getter),
         BackgroundTasksStatusTool(coordinator_getter),
         FollowBackgroundTaskTool(coordinator_getter),
         CancelBackgroundTaskTool(coordinator_getter),
@@ -262,9 +343,16 @@ Background task policy:
 - If a background task failed, do not take over the same file-changing work in the foreground. Explain the failure, ask for direction if needed, or schedule a new background retry.
 - After schedule_background_task returns, keep any follow-up brief and avoid repeating the same acknowledgement.
 """.strip()
+    tool_use_policy = """
+Tool use policy:
+- When you need multiple independent read-only tool calls, issue them in the same assistant turn whenever possible so the runtime can execute them in parallel.
+- This applies to web_search, web_fetch, search_code, read_file, and list_files.
+- Only call read-only tools sequentially when a later query truly depends on an earlier result.
+- Do not batch write, shell mutation, patch, approval, or background task management tools.
+""".strip()
     agents = workspace / "AGENTS.md"
     project_rules = agents.read_text() if agents.exists() else ""
-    return f"{safety}\n\n{personality_prompt}\n\n{default_prompt}\n\n{background_tasks}\n\nProject rules:\n{project_rules}"
+    return f"{safety}\n\n{personality_prompt}\n\n{default_prompt}\n\n{background_tasks}\n\n{tool_use_policy}\n\nProject rules:\n{project_rules}"
 
 
 def build_registry(
@@ -444,6 +532,8 @@ class ChatRuntime:
         self.async_notice_handler: Callable[[CoordinatorNotice], None] = _print_async_notice
         self.foreground_task: ForegroundTask | None = None
         self.active_user_input: str = ""
+        self.direct_approve_callback: Callable[[str], bool] = approve_action
+        self._foreground_tasks_by_thread: dict[int, ForegroundTask] = {}
         self.session_record, self.resumed_existing_session = self._select_session()
         self.session = self._load_session(self.session_record)
         self._ensure_bootstrap_contexts()
@@ -480,7 +570,9 @@ class ChatRuntime:
                         coordinator_getter=lambda: self.async_coordinator,
                         talk_callback=unavailable_talk_callback,
                         turn_context_getter=lambda: self.active_user_input,
+                        promoted_task_getter=self.current_promoted_foreground_task_id,
                     ),
+                    approve=self._route_approval,
                     pending_worker_questions=self._pending_worker_questions_for_input,
                     include_skill_context=False,
                     runtime_context_provider=self._async_context_summary,
@@ -635,6 +727,36 @@ class ChatRuntime:
             f"Log: {self.logger.path}"
         )
 
+    def config_text(self) -> str:
+        config = self.config
+        env_name = api_key_env_name(config.model.provider)
+        key_status = "set" if api_key_present(config.model.provider) else "missing"
+        return (
+            f"Provider: {config.model.provider}\n"
+            f"Model: {config.model.model}\n"
+            f"API key: {env_name} ({key_status})\n"
+            f"Global config: {global_config_path()}\n"
+            f"Project config: {workspace_config_path(self.workspace)}\n"
+            f"Secrets file: {secrets_env_path()}"
+        )
+
+    def doctor_text(self) -> str:
+        config = self.config
+        env_name = api_key_env_name(config.model.provider)
+        key_ok = api_key_present(config.model.provider)
+        lines = [
+            "Xiaoming doctor:",
+            f"- Provider: {config.model.provider}",
+            f"- Model: {config.model.model}",
+            f"- API key {env_name}: {'ok' if key_ok else 'missing'}",
+            f"- Global config: {'present' if global_config_path().exists() else 'missing'}",
+            f"- Project config: {'present' if workspace_config_path(self.workspace).exists() else 'missing'}",
+            f"- Stream: {'on' if config.agent.stream else 'off'}",
+        ]
+        if not key_ok:
+            lines.append(f"Run `xiaoming-cli --init` or set {env_name}.")
+        return "\n".join(lines)
+
     def context_text(self) -> str:
         if isinstance(self.loop, AgentLoop):
             return self.loop.context_status(self.session)
@@ -704,11 +826,37 @@ class ChatRuntime:
             return "foreground"
         return "orchestrator"
 
-    def begin_foreground_task(self, user_input: str) -> ForegroundTask:
-        task = ForegroundTask(task_name=_foreground_task_name(user_input), original_message=user_input)
+    def begin_foreground_task(self, user_input: str, cancel_event: threading.Event | None = None) -> ForegroundTask:
+        task = ForegroundTask(
+            task_name=_foreground_task_name(user_input),
+            original_message=user_input,
+            session_id=self.session.session_id,
+            boundary_snapshot=_foreground_boundary_snapshot(self.session, user_input),
+            cancel_event=cancel_event,
+        )
         self.foreground_task = task
         self.logger.info("foreground_task_started", task_name=task.task_name)
         return task
+
+    def bind_foreground_task_to_current_thread(self, task: ForegroundTask) -> None:
+        self._foreground_tasks_by_thread[threading.get_ident()] = task
+
+    def unbind_foreground_task_from_current_thread(self) -> None:
+        self._foreground_tasks_by_thread.pop(threading.get_ident(), None)
+
+    def _route_approval(self, action: str) -> bool:
+        task = self._foreground_tasks_by_thread.get(threading.get_ident())
+        if task is not None and task.status == "promoted" and task.worker_id and self.async_coordinator is not None:
+            request = getattr(self.async_coordinator, "request_promoted_foreground_approval", None)
+            if callable(request):
+                return bool(request(task.worker_id, action))
+        return self.direct_approve_callback(action)
+
+    def current_promoted_foreground_task_id(self) -> str:
+        task = self._foreground_tasks_by_thread.get(threading.get_ident())
+        if task is None or task.status != "promoted":
+            return ""
+        return task.worker_id or ""
 
     def finish_foreground_task(self, status: str = "completed") -> None:
         if self.foreground_task is None:
@@ -734,6 +882,45 @@ class ChatRuntime:
         self.foreground_task = None
         return f"当前任务已转为后台继续处理：{task.task_name}"
 
+    def promote_foreground_to_worker(self) -> str:
+        if self.foreground_task is None or self.foreground_task.status != "running":
+            return ""
+        if self.async_coordinator is None:
+            return ""
+        task = self.foreground_task
+        register = getattr(self.async_coordinator, "register_promoted_foreground_task", None)
+        if not callable(register):
+            return ""
+        worker_id = register(
+            task.task_name,
+            task.original_message,
+            task.session_id or self.session.session_id or "",
+            cancel_callback=task.cancel_event.set if task.cancel_event is not None else None,
+        )
+        task.worker_id = str(worker_id)
+        task.status = "promoted"
+        self._fork_main_session_from_foreground(task)
+        self.logger.info("foreground_task_promoted", task_name=task.task_name, worker_id=task.worker_id)
+        self.foreground_task = None
+        return f"当前任务已转为后台继续处理：{task.task_name}"
+
+    def complete_promoted_foreground_task(self, task_id: str, status: str, summary: str) -> None:
+        if self.async_coordinator is None:
+            return
+        complete = getattr(self.async_coordinator, "complete_promoted_foreground_task", None)
+        if callable(complete):
+            complete(task_id, status, summary)
+
+    def _fork_main_session_from_foreground(self, task: ForegroundTask) -> None:
+        snapshot = task.boundary_snapshot or _foreground_boundary_snapshot(self.session, task.original_message)
+        config = self.config
+        record = self.session_store.create(title=self.session_record.title or "New session", provider=config.model.provider, model=config.model.model)
+        new_session = _session_from_snapshot(snapshot, session_id=record.id)
+        new_session.input_items.append(_foreground_promoted_context_item(task))
+        self.session_store.append(record.id, "context_compaction_completed", {"replacement_items": copy.deepcopy(new_session.input_items), "created_at": now_iso()})
+        self.session_record = record
+        self.session = new_session
+
     def _async_context_summary(self) -> str | None:
         if self.async_coordinator is None:
             return None
@@ -746,6 +933,55 @@ class ChatRuntime:
 def _foreground_task_name(user_input: str) -> str:
     cleaned = " ".join(user_input.split())
     return cleaned[:40] or "前台任务"
+
+
+def _foreground_boundary_snapshot(session: Session, user_input: str) -> SessionSnapshot:
+    input_items = copy.deepcopy(session.input_items)
+    if not _ends_with_user_message(input_items, user_input):
+        input_items.append({"role": "user", "content": user_input, "xiaoming": {"kind": "user_message", "durable": True}})
+    return SessionSnapshot(
+        input_items=input_items,
+        loaded_skills=copy.deepcopy(session.loaded_skills),
+        bootstrap_contexts=copy.deepcopy(session.bootstrap_contexts),
+        base_instructions=session.base_instructions,
+        reference_turn_context=copy.deepcopy(session.reference_turn_context),
+    )
+
+
+def _session_from_snapshot(snapshot: SessionSnapshot, session_id: str) -> Session:
+    session = Session(
+        session_id=session_id,
+        input_items=copy.deepcopy(snapshot.input_items),
+        base_instructions=snapshot.base_instructions,
+        reference_turn_context=copy.deepcopy(snapshot.reference_turn_context),
+        loaded_skills=copy.deepcopy(snapshot.loaded_skills),
+        bootstrap_contexts=copy.deepcopy(snapshot.bootstrap_contexts),
+    )
+    return session
+
+
+def _foreground_promoted_context_item(task: ForegroundTask) -> dict:
+    return {
+        "role": "developer",
+        "content": (
+            "<foreground_promoted>\n"
+            "用户刚才的任务已在后台继续执行。\n"
+            f"task_id: {task.worker_id or ''}\n"
+            f"task_name: {task.task_name}\n"
+            f"原任务: {task.original_message}\n"
+            "不要继续执行原任务；如需进展，查询后台任务或 talk_to_peer。\n"
+            "现在处理用户的新输入。\n"
+            "</foreground_promoted>"
+        ),
+        "xiaoming": {"kind": "foreground_promoted", "durable": True, "task_id": task.worker_id or ""},
+    }
+
+
+def _ends_with_user_message(input_items: list[dict], user_input: str) -> bool:
+    if not input_items:
+        return False
+    item = input_items[-1]
+    return item.get("role") == "user" and str(item.get("content") or "") == user_input
 
 
 def _foreground_background_message(user_input: str) -> str:
@@ -802,6 +1038,12 @@ class TuiOutput:
                 if text:
                     self._lines.append(text)
 
+    def complete_streaming(self) -> None:
+        with self._lock:
+            if self._streaming:
+                self._lines.append(self._streaming)
+                self._streaming = ""
+
     def flush(self) -> str:
         """Return completed lines without touching streaming buffer."""
         with self._lock:
@@ -813,6 +1055,165 @@ class TuiOutput:
         """Return current streaming text without clearing it."""
         with self._lock:
             return self._streaming
+
+
+def _append_completed_tui_output(text: str, completed: str, streaming_pos: int) -> tuple[str, int]:
+    if not completed:
+        return text, streaming_pos
+    if streaming_pos >= 0:
+        return text[:streaming_pos] + completed, -1
+    return ((text + "\n" + completed) if text else completed), -1
+
+
+def _scroll_buffer_lines(buffer: Buffer, direction: int, count: int = 8) -> None:
+    for _ in range(max(1, count)):
+        if direction < 0:
+            buffer.cursor_up()
+        else:
+            buffer.cursor_down()
+
+
+def _make_output_window(output_buffer: Buffer) -> Window:
+    output_control = BufferControl(buffer=output_buffer, focusable=True)
+    return Window(content=output_control, wrap_lines=True)
+
+
+def _make_root_container(output_window: Window, input_area: TextArea) -> FloatContainer:
+    body = HSplit([
+        output_window,
+        Window(height=1, char="─", style="class:separator"),
+        input_area,
+    ])
+    return FloatContainer(
+        content=body,
+        floats=[
+            Float(
+                xcursor=True,
+                ycursor=True,
+                content=CompletionsMenu(max_height=12, scroll_offset=1),
+            )
+        ],
+    )
+
+
+@dataclass(frozen=True)
+class SlashCommand:
+    command: str
+    usage: str
+    description: str
+    needs_argument: bool = False
+
+
+SLASH_COMMANDS: tuple[SlashCommand, ...] = (
+    SlashCommand("/help", "/help", "Show available commands."),
+    SlashCommand("/status", "/status", "Show session and background task status."),
+    SlashCommand("/config", "/config", "Show current runtime configuration."),
+    SlashCommand("/doctor", "/doctor", "Check local setup."),
+    SlashCommand("/init", "/init", "Reconfigure provider, model, and API key."),
+    SlashCommand("/context", "/context", "Show context usage details."),
+    SlashCommand("/compact", "/compact", "Compact the current context."),
+    SlashCommand("/dream", "/dream", "Run dream-mode context organization."),
+    SlashCommand("/tasks", "/tasks", "List background tasks."),
+    SlashCommand("/talk", "/talk <peer-id> <message>", "Talk to a worker or external peer.", True),
+    SlashCommand("/cancel", "/cancel", "Cancel the current background task."),
+    SlashCommand("/cancel", "/cancel all", "Cancel all background tasks.", True),
+    SlashCommand("/quiet", "/quiet", "Reduce runtime progress output."),
+    SlashCommand("/verbose", "/verbose", "Show detailed runtime progress output."),
+    SlashCommand("/skills", "/skills", "List available skills."),
+    SlashCommand("/logs", "/logs", "Show log file location."),
+    SlashCommand("/session", "/session", "Show current session details."),
+    SlashCommand("/sessions", "/sessions", "List saved sessions."),
+    SlashCommand("/checkpoints", "/checkpoints", "List checkpoints."),
+    SlashCommand("/new", "/new", "Start a new session."),
+    SlashCommand("/rewind", "/rewind [checkpoint-id]", "Restore a checkpoint.", True),
+    SlashCommand("/resume", "/resume <session-id>", "Resume a saved session.", True),
+    SlashCommand("/skill", "/skill reload", "Reload skills.", True),
+    SlashCommand("/skill", "/skill install <github-tree-url>", "Install a skill from GitHub.", True),
+    SlashCommand("/model", "/model", "Show current model."),
+    SlashCommand("/model", "/model <openai|deepseek> <model>", "Switch provider and model.", True),
+    SlashCommand("/provider", "/provider <openai|deepseek>", "Switch provider.", True),
+    SlashCommand("/approval", "/approval <suggest|auto_edit|full_auto>", "Set approval mode.", True),
+    SlashCommand("/permission", "/permission", "Choose permission mode."),
+    SlashCommand("/permission-mode", "/permission-mode <default|plan|accept_edits|auto|bypass>", "Set permission mode.", True),
+    SlashCommand("/permissions", "/permissions", "Show permission rules."),
+    SlashCommand("/allow", "/allow Tool(pattern)", "Allow a permission rule.", True),
+    SlashCommand("/deny", "/deny Tool(pattern)", "Deny a permission rule.", True),
+    SlashCommand("/ask", "/ask Tool(pattern)", "Ask for matching permission rule.", True),
+    SlashCommand("/model-timeout", "/model-timeout <seconds>", "Set model timeout.", True),
+    SlashCommand("/stream", "/stream on|off", "Toggle streaming.", True),
+    SlashCommand("/clear", "/clear", "Clear current context."),
+    SlashCommand("/exit", "/exit", "Exit Xiaoming."),
+)
+
+PERMISSION_MODES: tuple[tuple[str, str], ...] = (
+    ("default", "Use project defaults and configured rules."),
+    ("plan", "Ask before edits and execution."),
+    ("accept_edits", "Allow edits, keep asking for execution."),
+    ("auto", "Allow routine work with fewer prompts."),
+    ("bypass", "Bypass permission prompts."),
+)
+
+
+class SlashCommandCompleter(Completer):
+    """Prompt-toolkit completer for top-level slash commands."""
+
+    def get_completions(self, document, complete_event):
+        text = document.text_before_cursor
+        if text.startswith("/permission "):
+            yield from _permission_mode_completions(text)
+            return
+        if text == "/permission":
+            yield from _permission_mode_completions("/permission ")
+            return
+        if not text.startswith("/") or any(char.isspace() for char in text):
+            return
+        prefix = text
+        seen: set[str] = set()
+        for entry in SLASH_COMMANDS:
+            if not entry.command.startswith(prefix):
+                continue
+            key = entry.usage
+            if key in seen:
+                continue
+            seen.add(key)
+            completion_text = _slash_completion_text(entry)
+            yield Completion(
+                completion_text,
+                start_position=-len(prefix),
+                display=entry.usage,
+                display_meta=entry.description,
+            )
+
+
+def _permission_mode_completions(text: str):
+    prefix = text.removeprefix("/permission").strip()
+    for mode, description in PERMISSION_MODES:
+        if not mode.startswith(prefix):
+            continue
+        yield Completion(
+            f"/permission-mode {mode}",
+            start_position=-len(text),
+            display=mode,
+            display_meta=description,
+        )
+
+
+def _slash_completion_text(entry: SlashCommand) -> str:
+    usage_parts = entry.usage.split()
+    if len(usage_parts) > 1 and all(not part.startswith("<") and not part.startswith("[") for part in usage_parts[1:]):
+        return entry.usage
+    return entry.command
+
+
+def _apply_selected_completion(buffer: Buffer) -> bool:
+    state = buffer.complete_state
+    if state is None:
+        return False
+    completion = state.current_completion
+    if completion is None:
+        return False
+    buffer.apply_completion(completion)
+    return True
 
 
 
@@ -842,38 +1243,29 @@ def run_chat(runtime_or_loop) -> int:
     # --- Build prompt_toolkit UI ---
     output_buffer = Buffer(read_only=False)
     output_buffer.text = "\n".join(startup_lines)
-    output_control = BufferControl(buffer=output_buffer, focusable=False)
-    output_window = Window(content=output_control)
+    output_window = _make_output_window(output_buffer)
 
     input_area = TextArea(
         text="",
         prompt="xiaoming> ",
         multiline=False,
+        completer=SlashCommandCompleter(),
+        complete_while_typing=True,
         height=1,
         wrap_lines=False,
     )
 
-    root_container = HSplit([
-        output_window,
-        Window(height=1, char="─", style="class:separator"),
-        input_area,
-    ])
+    root_container = _make_root_container(output_window, input_area)
 
     kb = KeyBindings()
-
-    @kb.add("c-c")
-    def _(event):
-        if runtime is not None and runtime.async_coordinator is not None:
-            emit(runtime.async_coordinator.cancel_current())
-        else:
-            cancel_event.set()
 
     style = Style.from_dict({"separator": "fg:#555555"})
 
     app = Application(
-        layout=Layout(root_container),
+        layout=Layout(root_container, focused_element=input_area),
         key_bindings=kb,
         style=style,
+        mouse_support=True,
         full_screen=True,
     )
 
@@ -881,12 +1273,44 @@ def run_chat(runtime_or_loop) -> int:
         """Write to output buffer (thread-safe). UI refresh via periodic timer."""
         output.write(text, end=end)
 
+    @kb.add("c-c")
+    def _(event):
+        if runtime is not None and runtime.async_coordinator is not None:
+            if runtime.foreground_task is not None and runtime.foreground_task.cancel_event is not None:
+                runtime.foreground_task.cancel_event.set()
+                _emit("Interrupted current operation.")
+            else:
+                _emit(runtime.async_coordinator.cancel_current())
+            _invalidate_ui()
+        else:
+            cancel_event.set()
+
+    @kb.add("pageup")
+    @kb.add("c-up")
+    def _(event):
+        _scroll_buffer_lines(output_buffer, -1)
+
+    @kb.add("pagedown")
+    @kb.add("c-down")
+    def _(event):
+        _scroll_buffer_lines(output_buffer, 1)
+
     def _invalidate_ui() -> None:
         """Schedule a UI refresh. Called from agent thread after output."""
         try:
             app.invalidate()
         except Exception:
             pass
+
+    async_notices.on_enqueue = _invalidate_ui
+
+    approval_controller = TuiApprovalController(output, _invalidate_ui)
+    if runtime is not None and runtime.loop_factory is build_loop:
+        runtime.direct_approve_callback = approval_controller.request
+        runtime.loop = runtime._build_loop()
+        loop = runtime.loop
+    if runtime is not None and runtime.async_coordinator is not None:
+        runtime.async_coordinator.replay_pending_questions()
 
     _streaming_pos = -1  # position in output_buffer where streaming text starts
 
@@ -896,8 +1320,7 @@ def run_chat(runtime_or_loop) -> int:
         streaming = output.peek_streaming()
 
         if completed:
-            _streaming_pos = -1
-            output_buffer.text = (output_buffer.text + "\n" + completed) if output_buffer.text else completed
+            output_buffer.text, _streaming_pos = _append_completed_tui_output(output_buffer.text, completed, _streaming_pos)
             output_buffer.cursor_position = len(output_buffer.text)
 
         if streaming:
@@ -914,6 +1337,8 @@ def run_chat(runtime_or_loop) -> int:
         for notice in notices:
             _streaming_pos = -1
             output_buffer.text += f"\n[xiaoming] {notice.message}"
+            if notice.message_id and runtime is not None and runtime.async_coordinator is not None:
+                runtime.async_coordinator.mark_notice_presented(notice.message_id)
 
     def _before_render(_app):
         _refresh_ui()
@@ -942,23 +1367,39 @@ def run_chat(runtime_or_loop) -> int:
                         loop, user_input, session=session,
                         on_event=_on_progress_emit,
                     )
-                    output.write("")  # complete any pending streaming
+                    output.complete_streaming()
                     _invalidate_ui()
                     return
-                cancel_event.clear()
-                checkpoint = runtime.checkpoint_store.create(runtime.session.session_id, user_input)
+                runner_cancel_event = threading.Event()
+                foreground_task = runtime.begin_foreground_task(user_input, cancel_event=runner_cancel_event)
+                runtime.bind_foreground_task_to_current_thread(foreground_task)
+                active_session = runtime.session
+                checkpoint = runtime.checkpoint_store.create(active_session.session_id, user_input)
                 runtime.active_checkpoint_id = checkpoint.id
                 try:
-                    run_loop_with_progress(
+                    answer = run_loop_with_progress(
                         runtime.loop, user_input,
-                        session=session,
-                        on_event=_on_progress_emit,
-                        should_cancel=cancel_event.is_set,
+                        session=active_session,
+                        on_event=lambda message: None if foreground_task.status == "promoted" else _on_progress_emit(message),
+                        should_cancel=runner_cancel_event.is_set,
                     )
-                    output.write("")  # complete any pending streaming
-                    _invalidate_ui()
+                    if foreground_task.status == "promoted" and foreground_task.worker_id:
+                        runtime.complete_promoted_foreground_task(foreground_task.worker_id, "completed", answer or "Task completed.")
+                    else:
+                        runtime.finish_foreground_task("completed")
+                        output.complete_streaming()
+                        _invalidate_ui()
+                except Exception:
+                    if foreground_task.status == "promoted" and foreground_task.worker_id:
+                        runtime.complete_promoted_foreground_task(foreground_task.worker_id, "failed", "后台任务失败。")
+                    else:
+                        runtime.finish_foreground_task("failed")
+                    raise
                 finally:
+                    runtime.unbind_foreground_task_from_current_thread()
                     runtime.active_checkpoint_id = None
+                    if runtime.active_user_input == user_input:
+                        runtime.active_user_input = ""
             except Exception as exc:
                 if runtime is not None:
                     runtime.logger.error("cli_turn_exception", exc=exc, user_input=user_input)
@@ -979,13 +1420,44 @@ def run_chat(runtime_or_loop) -> int:
 
     threading.Thread(target=_periodic_invalidate, daemon=True).start()
 
+    @kb.add("/")
+    def _(event):
+        buffer = input_area.buffer
+        buffer.insert_text("/")
+        if buffer.document.text_before_cursor == "/":
+            buffer.start_completion(select_first=True)
+
+    @kb.add("down")
+    def _(event):
+        buffer = input_area.buffer
+        if buffer.complete_state is not None:
+            buffer.complete_next()
+
+    @kb.add("up")
+    def _(event):
+        buffer = input_area.buffer
+        if buffer.complete_state is not None:
+            buffer.complete_previous()
+
     # Enter key: echo input + run agent
     @kb.add("enter")
     def _(event):
+        _apply_selected_completion(input_area.buffer)
         user_input = input_area.text.strip()
         if not user_input:
+            if approval_controller.has_pending():
+                input_area.text = ""
+                approval_controller.consume_answer("")
+                output.write("Denied.")
+                _invalidate_ui()
             return
         input_area.text = ""
+        approval = approval_controller.consume_answer(user_input)
+        if approval is not None:
+            output.write(f">>> {user_input}")
+            output.write("Approved." if approval else "Denied.")
+            _invalidate_ui()
+            return
         output.write(f">>> {user_input}")
         _invalidate_ui()
         result = _handle_input(user_input, runtime, session, loop,
@@ -1039,15 +1511,18 @@ def _read_user_input_until_done(prompt: str, async_notices=None, done: threading
 class AsyncNoticeBuffer:
     POLL_SECONDS = 0.1
 
-    def __init__(self) -> None:
+    def __init__(self, on_enqueue: Callable[[], None] | None = None) -> None:
         self._lock = threading.Lock()
         self._notices: list[CoordinatorNotice] = []
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        self.on_enqueue = on_enqueue
 
     def enqueue(self, notice: CoordinatorNotice) -> None:
         with self._lock:
             self._notices.append(notice)
+        if self.on_enqueue is not None:
+            self.on_enqueue()
 
     def start(self) -> None:
         if self._thread is not None:
@@ -1092,6 +1567,11 @@ def _handle_input(user_input: str, runtime, session, loop, output: TuiOutput,
     if user_input in {"exit", "quit", "/exit", "/quit"}:
         return "exit"
 
+    if runtime is not None and runtime.foreground_task is not None and runtime.foreground_task.status == "running":
+        promoted = runtime.promote_foreground_to_worker()
+        if promoted:
+            emit(promoted)
+
     if user_input in {"/", "/help"}:
         output.write(_help_text())
         return None
@@ -1112,6 +1592,24 @@ def _handle_input(user_input: str, runtime, session, loop, output: TuiOutput,
             emit(runtime.async_coordinator.status_text())
         else:
             emit(runtime.status_text())
+        return None
+
+    if user_input == "/config":
+        if runtime is None:
+            emit("Config is only available in xiaoming-cli runtime mode.")
+        else:
+            emit(runtime.config_text())
+        return None
+
+    if user_input == "/doctor":
+        if runtime is None:
+            emit("Doctor is only available in xiaoming-cli runtime mode.")
+        else:
+            emit(runtime.doctor_text())
+        return None
+
+    if user_input == "/init":
+        emit("Run `xiaoming-cli --init` in a normal terminal to reconfigure provider, model, and API key.")
         return None
 
     if user_input == "/context":
@@ -1237,15 +1735,54 @@ def _handle_input(user_input: str, runtime, session, loop, output: TuiOutput,
             emit(str(runtime.logger.path))
         return None
 
-    if runtime is not None and _handle_skill_command(runtime, user_input):
-        return None
+    if runtime is not None:
+        skill_output = _handle_skill_command(runtime, user_input)
+        if skill_output is not None:
+            emit(skill_output)
+            return None
 
-    if runtime is not None and _handle_config_command(runtime, user_input):
-        return None
+        config_output = _handle_config_command(runtime, user_input)
+        if config_output is not None:
+            emit(config_output)
+            return None
+
+    if runtime is not None:
+        runtime.active_user_input = user_input
 
     # Run agent in background thread
     run_agent_task(user_input)
     return None
+
+
+def should_run_initialization(workspace: Path) -> bool:
+    config = load_config(workspace, {})
+    return not api_key_present(config.model.provider)
+
+
+def run_initialization_wizard(
+    workspace: Path,
+    input_fn: Callable[[str], str] = input,
+    output_fn: Callable[[str], None] = print,
+    force: bool = False,
+) -> bool:
+    if not force and not should_run_initialization(workspace):
+        return False
+    output_fn("Xiaoming setup")
+    output_fn("Choose a model provider: 1) DeepSeek (recommended)  2) OpenAI")
+    provider_answer = input_fn("Provider [1]: ").strip().lower()
+    provider = "openai" if provider_answer in {"2", "openai"} else "deepseek"
+    default_model = DEFAULT_DEEPSEEK_MODEL if provider == "deepseek" else DEFAULT_OPENAI_MODEL
+    model = input_fn(f"Model [{default_model}]: ").strip() or default_model
+    save_global_config(provider=provider, model=model)
+    env_name = api_key_env_name(provider)
+    api_key = input_fn(f"{env_name} (leave empty to use existing environment variable): ").strip()
+    if api_key:
+        write_secrets_env(provider=provider, api_key=api_key)
+        output_fn(f"Saved API key to {secrets_env_path()}")
+    else:
+        output_fn(f"Skipped API key storage. Set {env_name} in your shell before using Xiaoming.")
+    output_fn(f"Saved config to {global_config_path()}")
+    return True
 
 
 def run_loop_with_progress(loop, task: str, session: Session | None, should_cancel: Callable[[], bool] | None = None, on_event=None) -> str:
@@ -1258,157 +1795,120 @@ def run_loop_with_progress(loop, task: str, session: Session | None, should_canc
     return loop.run(task, **kwargs)
 
 
-def _handle_config_command(runtime: ChatRuntime, user_input: str) -> bool:
+def _handle_config_command(runtime: ChatRuntime, user_input: str) -> str | None:
     parts = user_input.split()
     if not parts:
-        return False
+        return None
     command = parts[0]
     if command == "/model":
         if len(parts) == 1:
             config = runtime.config
-            print(f"Provider: {config.model.provider}\nModel: {config.model.model}")
-            return True
+            return f"Provider: {config.model.provider}\nModel: {config.model.model}"
         if len(parts) != 3:
-            print("Usage: /model <openai|deepseek> <model>")
-            return True
+            return "Usage: /model <openai|deepseek> <model>"
         provider, model = parts[1], parts[2]
         if provider not in {"openai", "deepseek"}:
-            print("Provider must be openai or deepseek.")
-            return True
+            return "Provider must be openai or deepseek."
         ok, error = runtime.try_update(provider=provider, model=model)
         if not ok:
-            print(f"Error switching model: {error}")
-            return True
+            return f"Error switching model: {error}"
         _restart_async_coordinator(runtime)
-        print(f"Model switched to {provider} {model}. Context cleared.")
-        return True
+        return f"Model switched to {provider} {model}. Context cleared."
     if command == "/provider":
         if len(parts) != 2:
-            print("Usage: /provider <openai|deepseek>")
-            return True
+            return "Usage: /provider <openai|deepseek>"
         provider = parts[1]
         if provider not in {"openai", "deepseek"}:
-            print("Provider must be openai or deepseek.")
-            return True
+            return "Provider must be openai or deepseek."
         ok, error = runtime.try_update(provider=provider, model=None)
         if not ok:
-            print(f"Error switching provider: {error}")
-            return True
+            return f"Error switching provider: {error}"
         _restart_async_coordinator(runtime)
         config = runtime.config
-        print(f"Provider switched to {config.model.provider} {config.model.model}. Context cleared.")
-        return True
+        return f"Provider switched to {config.model.provider} {config.model.model}. Context cleared."
     if command == "/approval":
         if len(parts) != 2:
-            print("Usage: /approval <suggest|auto_edit|full_auto>")
-            return True
+            return "Usage: /approval <suggest|auto_edit|full_auto>"
         mode = parts[1]
         if mode not in {"suggest", "auto_edit", "full_auto"}:
-            print("Approval mode must be suggest, auto_edit, or full_auto.")
-            return True
+            return "Approval mode must be suggest, auto_edit, or full_auto."
         ok, error = runtime.try_update(approval_mode=mode)
         if not ok:
-            print(f"Error switching approval mode: {error}")
-            return True
+            return f"Error switching approval mode: {error}"
         _restart_async_coordinator(runtime)
-        print(f"Approval mode set to {mode}. Context cleared.")
-        return True
-    if command == "/permission-mode":
+        return f"Approval mode set to {mode}. Context cleared."
+    if command in {"/permission", "/permission-mode"}:
         if len(parts) == 1:
-            print(f"Permission mode: {runtime.config.agent.permission_mode}")
-            return True
+            return f"Permission mode: {runtime.config.agent.permission_mode}"
         if len(parts) != 2:
-            print("Usage: /permission-mode <default|plan|accept_edits|auto|bypass>")
-            return True
+            return "Usage: /permission-mode <default|plan|accept_edits|auto|bypass>"
         mode = parts[1]
         if mode not in {"default", "plan", "accept_edits", "auto", "bypass"}:
-            print("Permission mode must be default, plan, accept_edits, auto, or bypass.")
-            return True
+            return "Permission mode must be default, plan, accept_edits, auto, or bypass."
         ok, error = runtime.try_update(permission_mode=mode)
         if not ok:
-            print(f"Error switching permission mode: {error}")
-            return True
+            return f"Error switching permission mode: {error}"
         _restart_async_coordinator(runtime)
-        print(f"Permission mode set to {mode}. Context cleared.")
-        return True
+        return f"Permission mode set to {mode}. Context cleared."
     if command == "/permissions":
         rules = load_project_rules(runtime.workspace)
         if not rules:
-            print(f"No project permission rules. File: {permissions_path(runtime.workspace)}")
-            return True
-        print("\n".join(f"{rule.behavior.value} {rule.tool}({rule.pattern}) [{rule.source}]" for rule in rules))
-        return True
+            return f"No project permission rules. File: {permissions_path(runtime.workspace)}"
+        return "\n".join(f"{rule.behavior.value} {rule.tool}({rule.pattern}) [{rule.source}]" for rule in rules)
     if command in {"/allow", "/deny", "/ask"}:
         if len(parts) < 2:
-            print(f"Usage: {command} Tool(pattern)")
-            return True
+            return f"Usage: {command} Tool(pattern)"
         parsed = _parse_permission_rule(" ".join(parts[1:]), PermissionBehavior(command.removeprefix("/")))
         if parsed is None:
-            print(f"Usage: {command} Tool(pattern)")
-            return True
+            return f"Usage: {command} Tool(pattern)"
         add_project_rule(runtime.workspace, parsed)
         runtime.reload_skills()
-        print(f"Added project rule: {parsed.behavior.value} {parsed.tool}({parsed.pattern})")
-        return True
+        return f"Added project rule: {parsed.behavior.value} {parsed.tool}({parsed.pattern})"
     if command == "/model-timeout":
         if len(parts) != 2:
-            print("Usage: /model-timeout <seconds>")
-            return True
+            return "Usage: /model-timeout <seconds>"
         try:
             seconds = float(parts[1])
         except ValueError:
-            print("Model timeout must be a number of seconds.")
-            return True
+            return "Model timeout must be a number of seconds."
         ok, error = runtime.try_update(model_timeout_seconds=seconds)
         if not ok:
-            print(f"Error switching model timeout: {error}")
-            return True
+            return f"Error switching model timeout: {error}"
         _restart_async_coordinator(runtime)
-        print(f"Model timeout set to {seconds:g}s. Context cleared.")
-        return True
+        return f"Model timeout set to {seconds:g}s. Context cleared."
     if command == "/stream":
         if len(parts) == 1:
-            print(f"Stream: {'on' if runtime.config.agent.stream else 'off'}")
-            return True
+            return f"Stream: {'on' if runtime.config.agent.stream else 'off'}"
         if len(parts) != 2 or parts[1] not in {"on", "off"}:
-            print("Usage: /stream on|off")
-            return True
+            return "Usage: /stream on|off"
         enabled = parts[1] == "on"
         ok, error = runtime.try_update(stream=enabled)
         if not ok:
-            print(f"Error switching stream mode: {error}")
-            return True
+            return f"Error switching stream mode: {error}"
         _restart_async_coordinator(runtime)
-        print(f"Stream {'enabled' if enabled else 'disabled'}. Context cleared.")
-        return True
+        return f"Stream {'enabled' if enabled else 'disabled'}. Context cleared."
     if command == "/resume":
         if len(parts) != 2:
-            print("Usage: /resume <session-id>")
-            return True
+            return "Usage: /resume <session-id>"
         if not runtime.resume_session(parts[1]):
-            print(f"Unknown session: {parts[1]}")
-            return True
-        print(f"Resumed session: {parts[1]}")
-        return True
-    return False
+            return f"Unknown session: {parts[1]}"
+        return f"Resumed session: {parts[1]}"
+    return None
 
 
-def _handle_skill_command(runtime: ChatRuntime, user_input: str) -> bool:
+def _handle_skill_command(runtime: ChatRuntime, user_input: str) -> str | None:
     parts = user_input.split(maxsplit=2)
     if not parts or parts[0] != "/skill":
-        return False
+        return None
     if len(parts) == 2 and parts[1] == "reload":
         runtime.reload_skills()
-        print("Skills reloaded.")
-        return True
+        return "Skills reloaded."
     if len(parts) == 3 and parts[1] == "install":
         try:
-            print(runtime.install_skill(parts[2]))
+            return runtime.install_skill(parts[2])
         except SkillInstallError as exc:
-            print(f"Error installing skill: {exc}")
-        return True
-    print("Usage: /skill reload | /skill install <github-tree-url>")
-    return True
+            return f"Error installing skill: {exc}"
+    return "Usage: /skill reload | /skill install <github-tree-url>"
 
 
 def _restart_async_coordinator(runtime: ChatRuntime) -> None:
@@ -1420,43 +1920,9 @@ def _restart_async_coordinator(runtime: ChatRuntime) -> None:
 
 
 def _help_text() -> str:
-    return (
-        "Commands:\n"
-        "/help\n"
-        "/status\n"
-        "/context\n"
-        "/compact\n"
-        "/dream\n"
-        "/tasks\n"
-        "/talk <peer-id> <message>\n"
-        "/cancel\n"
-        "/cancel all\n"
-        "/quiet\n"
-        "/verbose\n"
-        "/skills\n"
-        "/logs\n"
-        "/session\n"
-        "/sessions\n"
-        "/checkpoints\n"
-        "/new\n"
-        "/rewind [checkpoint-id]\n"
-        "/resume <session-id>\n"
-        "/skill reload\n"
-        "/skill install <github-tree-url>\n"
-        "/model\n"
-        "/model <openai|deepseek> <model>\n"
-        "/provider <openai|deepseek>\n"
-        "/approval <suggest|auto_edit|full_auto>\n"
-        "/permission-mode <default|plan|accept_edits|auto|bypass>\n"
-        "/permissions\n"
-        "/allow Tool(pattern)\n"
-        "/deny Tool(pattern)\n"
-        "/ask Tool(pattern)\n"
-        "/model-timeout <seconds>\n"
-        "/stream on|off\n"
-        "/clear\n"
-        "/exit"
-    )
+    lines = ["Commands:"]
+    lines.extend(entry.usage for entry in SLASH_COMMANDS)
+    return "\n".join(lines)
 
 
 def _parse_permission_rule(text: str, behavior: PermissionBehavior) -> PermissionRule | None:
@@ -1472,7 +1938,12 @@ def _parse_permission_rule(text: str, behavior: PermissionBehavior) -> Permissio
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    if getattr(args, "init", False):
+        run_initialization_wizard(Path.cwd(), force=True)
+        return 0
     if args.task is None or args.task == "chat":
+        if sys.stdin.isatty():
+            run_initialization_wizard(Path.cwd(), force=False)
         return run_chat(ChatRuntime(Path.cwd(), args))
     loop = build_loop(Path.cwd(), args)
     answer = run_loop_with_progress(loop, args.task, session=None)

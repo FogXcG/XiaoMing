@@ -75,6 +75,7 @@ def _record_from_dict(data: dict) -> TaskRecord | None:
             forked_loaded_skills=[dict(item) for item in data.get("forked_loaded_skills") or [] if isinstance(item, dict)],
             task_decision_log=[str(item) for item in data.get("task_decision_log") or []],
             worker_question_log=[str(item) for item in data.get("worker_question_log") or []],
+            last_worker_answer_decision=str(data.get("last_worker_answer_decision") or ""),
             authorization_log=[str(item) for item in data.get("authorization_log") or []],
             revision_attempts=int(data.get("revision_attempts") or 0),
             parent_task_id=str(data.get("parent_task_id")) if data.get("parent_task_id") is not None else None,

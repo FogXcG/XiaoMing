@@ -13,6 +13,7 @@ from xiaoming.async_runtime.scheduler import SchedulerDecision, SchedulerError
 from xiaoming.async_runtime.task_store import TaskStore
 from xiaoming.async_runtime.tasks import TaskRecord, TaskRegistry, TaskSpec, VerificationResult
 from xiaoming.session import LoadedSkill, Session
+from xiaoming.tools.background_task import ScheduleBackgroundTaskTool
 
 
 def _canonical_bytes(value) -> bytes:
@@ -355,6 +356,60 @@ def test_coordinator_routes_codex_task_from_internal_route_note(monkeypatch, tmp
     assert result.status == "success"
     assert started == ["开发一个简单的中国象棋网页"]
     assert task.agent_type == "codex"
+
+
+def test_schedule_background_task_tool_routes_rewritten_hello_world_request_to_codex(monkeypatch, tmp_path: Path):
+    started = []
+
+    class FakeCodexWorker:
+        def __init__(self, config, on_event):
+            self.config = config
+            self.on_event = on_event
+            self.pid = None
+
+        def start(self):
+            started.append(self.config.task)
+            self.on_event(
+                WorkerEvent(
+                    self.config.task_id,
+                    "completed",
+                    "codex done",
+                    {"external_provider": "codex", "external_session_id": "codex-thread-hello-world"},
+                )
+            )
+
+        def send(self, kind, **payload):
+            pass
+
+        def terminate(self, timeout_seconds=5):
+            pass
+
+    monkeypatch.setattr("xiaoming.async_runtime.coordinator.CodexWorkerProcess", FakeCodexWorker)
+    coordinator = AsyncCoordinator(CoordinatorConfig(tmp_path), scheduler=FakeScheduler(), responder=FakeResponder(), verifier=RecordingVerifier())
+    tool = ScheduleBackgroundTaskTool(
+        lambda: coordinator,
+        turn_context_getter=lambda: "在后台使用codex开发一个简单的hello world网页",
+    )
+    coordinator.start()
+    try:
+        result = tool.run(
+            {
+                "task_name": "Hello World 网页",
+                "message": "在 workspace 中创建一个简单的 Hello World 网页。使用 HTML + CSS，设计简洁美观。创建一个 index.html 文件。",
+            }
+        )
+        _eventually(lambda: coordinator.registry.list()[0].status == "accepted")
+        task = coordinator.registry.list()[0]
+        external = coordinator.external_sessions[task.task_id]
+    finally:
+        coordinator.stop()
+
+    assert result.status == "success"
+    assert task.agent_type == "codex"
+    assert task.title == "Hello World 网页"
+    assert started == ["在 workspace 中创建一个简单的 Hello World 网页。使用 HTML + CSS，设计简洁美观。创建一个 index.html 文件。"]
+    assert external.provider == "codex"
+    assert external.session_id == "codex-thread-hello-world"
 
 
 def test_coordinator_records_external_session_from_codex_progress(monkeypatch, tmp_path: Path):
@@ -1219,6 +1274,115 @@ def test_current_tasks_text_excludes_cancelled_history(tmp_path: Path):
     assert "cancelled" in history
 
 
+def test_promoted_foreground_task_is_registered_and_completes(tmp_path: Path):
+    notices = []
+    coordinator = AsyncCoordinator(CoordinatorConfig(tmp_path), scheduler=FakeScheduler(), responder=FakeResponder(), on_notice=notices.append)
+
+    task_id = coordinator.register_promoted_foreground_task("安装 skill", "安装 superpowers skill", "session-1")
+    status = coordinator.current_tasks_text()
+
+    assert task_id[:8] in status
+    assert "安装 skill" in status
+
+    coordinator.complete_promoted_foreground_task(task_id, "completed", "done")
+
+    assert "accepted" in coordinator.tasks_text()
+    assert any("已完成" in notice.message for notice in notices)
+
+
+def test_cancel_promoted_foreground_task_calls_cancel_callback(tmp_path: Path):
+    coordinator = AsyncCoordinator(CoordinatorConfig(tmp_path), scheduler=FakeScheduler(), responder=FakeResponder())
+    cancelled = []
+    task_id = coordinator.register_promoted_foreground_task("前台任务", "long task", "session-1", cancel_callback=lambda: cancelled.append(True))
+
+    result = coordinator.cancel_task(task_id)
+
+    assert result.status == "success"
+    assert cancelled == [True]
+    assert "cancelled" in coordinator.tasks_text()
+
+
+def test_promoted_foreground_approval_waits_for_mailbox_reply(tmp_path: Path):
+    notices = []
+    coordinator = AsyncCoordinator(CoordinatorConfig(tmp_path), scheduler=FakeScheduler(), responder=FakeResponder(), on_notice=notices.append)
+    task_id = coordinator.register_promoted_foreground_task("前台任务", "long task", "session-1")
+    result = []
+
+    thread = threading.Thread(target=lambda: result.append(coordinator.request_promoted_foreground_approval(task_id, "write file?")))
+    thread.start()
+    _eventually(lambda: bool(coordinator.mailbox.pending_reply_messages()))
+    message = coordinator.mailbox.pending_reply_messages()[0]
+
+    try:
+        assert "write file?" in message.content
+        _eventually(lambda: any(notice.message_id == message.message_id for notice in notices))
+    finally:
+        reply = coordinator.reply_mailbox_message(message.message_id, "yes", decision="approved")
+        thread.join(timeout=2)
+    assert reply.status == "success"
+    assert result == [True]
+
+
+def test_promoted_foreground_approval_uses_structured_decision_not_reply_text(tmp_path: Path):
+    coordinator = AsyncCoordinator(CoordinatorConfig(tmp_path), scheduler=FakeScheduler(), responder=FakeResponder())
+    task_id = coordinator.register_promoted_foreground_task("前台任务", "install skill", "session-1")
+    result = []
+
+    thread = threading.Thread(target=lambda: result.append(coordinator.request_promoted_foreground_approval(task_id, "install skill?")))
+    thread.start()
+    _eventually(lambda: bool(coordinator.mailbox.pending_reply_messages()))
+    message = coordinator.mailbox.pending_reply_messages()[0]
+
+    reply = coordinator.reply_mailbox_message(message.message_id, "同意安装", decision="approved")
+    thread.join(timeout=2)
+
+    assert reply.status == "success"
+    assert result == [True]
+
+
+def test_promoted_foreground_denied_approval_does_not_complete_as_accepted(tmp_path: Path):
+    notices = []
+    coordinator = AsyncCoordinator(CoordinatorConfig(tmp_path), scheduler=FakeScheduler(), responder=FakeResponder(), on_notice=notices.append)
+    task_id = coordinator.register_promoted_foreground_task("前台任务", "install skill", "session-1")
+    result = []
+
+    thread = threading.Thread(target=lambda: result.append(coordinator.request_promoted_foreground_approval(task_id, "install skill?")))
+    thread.start()
+    _eventually(lambda: bool(coordinator.mailbox.pending_reply_messages()))
+    message = coordinator.mailbox.pending_reply_messages()[0]
+    coordinator.reply_mailbox_message(message.message_id, "不同意安装", decision="denied")
+    thread.join(timeout=2)
+
+    coordinator.complete_promoted_foreground_task(task_id, "completed", "Task completed.")
+
+    assert result == [False]
+    assert "failed" in coordinator.tasks_text()
+    assert any("失败" in notice.message for notice in notices)
+
+
+def test_talk_to_promoted_foreground_task_returns_status(tmp_path: Path):
+    coordinator = AsyncCoordinator(CoordinatorConfig(tmp_path), scheduler=FakeScheduler(), responder=FakeResponder())
+    task_id = coordinator.register_promoted_foreground_task("前台任务", "long task", "session-1")
+
+    result = coordinator.talk_to_peer(task_id, "怎么样了")
+
+    assert result.status == "success"
+    assert "前台任务" in result.output
+    assert "running" in result.output
+
+
+def test_talk_to_waiting_task_prefix_returns_status_instead_of_unknown(tmp_path: Path):
+    coordinator = AsyncCoordinator(CoordinatorConfig(tmp_path), scheduler=FakeScheduler(), responder=FakeResponder())
+    task = TaskRecord(title="安装 superpowers skill", original_request="安装 skill", current_goal="安装 skill", status="waiting")
+    coordinator.registry.add(task)
+
+    result = coordinator.talk_to_peer(task.task_id[:8], "现在怎么样了？")
+
+    assert result.status == "success"
+    assert "安装 superpowers skill" in result.output
+    assert "waiting" in result.output
+
+
 def test_reported_completed_task_accepts_directory_scope_and_described_artifact(tmp_path: Path):
     notices = []
     workers = []
@@ -1610,7 +1774,7 @@ def test_coordinator_replies_to_worker_question_by_mailbox_message_id(tmp_path: 
     assert status_after_answer == "running"
 
 
-def test_coordinator_marks_mailbox_question_presented_when_notice_is_emitted(tmp_path: Path):
+def test_coordinator_does_not_mark_mailbox_question_presented_until_ui_ack(tmp_path: Path):
     notices = []
     workers = []
 
@@ -1631,6 +1795,13 @@ def test_coordinator_marks_mailbox_question_presented_when_notice_is_emitted(tmp
         coordinator.stop()
 
     assert notices
+    question_notice = next(notice for notice in notices if notice.message_id == message.message_id)
+    assert question_notice.task_id == message.task_id
+    assert message.presented_count == 0
+    assert message.last_presented_at is None
+
+    coordinator.mark_notice_presented(message.message_id)
+
     assert message.presented_count == 1
     assert message.last_presented_at
 
@@ -1657,7 +1828,30 @@ def test_coordinator_question_notice_is_driven_by_mailbox_candidate(tmp_path: Pa
         coordinator.stop()
 
     assert any(notice.message == "写 README 需要你确认：写 README：允许写 README.md？" for notice in notices)
-    assert message.presented_count == 1
+    assert message.presented_count == 0
+
+
+def test_coordinator_can_replay_presented_pending_questions_on_cli_start(tmp_path: Path):
+    notices = []
+    coordinator = AsyncCoordinator(CoordinatorConfig(tmp_path), scheduler=FakeScheduler(), responder=FakeResponder(), worker_factory=lambda config, on_event: FakeWorker(config, on_event), on_notice=notices.append)
+    task = coordinator.registry.add(TaskRecord(title="旧任务", original_request="写 README", current_goal="写 README", task_id="task-1", status="needs_user"))
+    message = coordinator.mailbox.create_message(
+        task_id=task.task_id,
+        worker_id=task.task_id,
+        from_role="worker",
+        to_role="main",
+        kind="approval_request",
+        content="允许写 README.md？",
+        requires_reply=True,
+        metadata={"request_id": "approve-1", "task_title": task.title},
+    )
+    coordinator.mailbox.mark_presented(message.message_id)
+
+    replayed = coordinator.replay_pending_questions()
+
+    assert replayed == 1
+    assert notices[0].message_id == message.message_id
+    assert notices[0].message == "旧任务 需要你确认：允许写 README.md？"
 
 
 def test_coordinator_persists_worker_question_mailbox(tmp_path: Path):

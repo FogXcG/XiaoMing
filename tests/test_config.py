@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from xiaoming.config import DEFAULT_MAX_OUTPUT_TOKENS, AgentConfig, load_config
+from xiaoming.config import DEFAULT_MAX_OUTPUT_TOKENS, AgentConfig, load_config, load_secrets_env, save_global_config, write_secrets_env
 
 
 def test_default_config_uses_suggest_mode(tmp_path: Path):
@@ -64,6 +64,34 @@ def test_deepseek_provider_defaults_to_v4_flash(tmp_path: Path):
 
     assert config.model.provider == "deepseek"
     assert config.model.model == "deepseek-v4-flash"
+
+
+def test_load_config_reads_global_and_project_config(tmp_path: Path, monkeypatch):
+    home = tmp_path / "home"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setenv("XIAOMING_HOME", str(home))
+    save_global_config(provider="openai", model="gpt-5")
+    project_config = workspace / ".xiaoming" / "config.toml"
+    project_config.parent.mkdir()
+    project_config.write_text("[model]\nprovider = \"deepseek\"\nmodel = \"deepseek-v4-pro\"\n")
+
+    config = load_config(workspace=workspace, cli_args={})
+
+    assert config.model.provider == "deepseek"
+    assert config.model.model == "deepseek-v4-pro"
+
+
+def test_load_secrets_env_sets_missing_keys(tmp_path: Path, monkeypatch):
+    home = tmp_path / "home"
+    monkeypatch.setenv("XIAOMING_HOME", str(home))
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    write_secrets_env(provider="deepseek", api_key="sk-test")
+
+    loaded = load_secrets_env()
+
+    assert loaded == {"DEEPSEEK_API_KEY": "sk-test"}
+    assert __import__("os").environ["DEEPSEEK_API_KEY"] == "sk-test"
 
 
 def test_agent_config_rejects_unknown_approval_mode():

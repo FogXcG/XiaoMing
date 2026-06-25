@@ -17,6 +17,7 @@ A personal AI agent with hierarchical memory, async task coordination, and tool 
 - [x] Eval harness and terminal-bench adapter
 - [ ] Voice interaction — combine with XiaoBai's real-time voice capabilities
 - [ ] Self-evolution — candidate worktrees, smoke tests, safe activation
+- [ ] External agent routing — when the user explicitly requests Codex/Claude Code, the main agent must delegate instead of executing workspace-changing tools itself
 - [ ] Agent-to-Agent communication — natural-language messaging between Xiaoming instances
 - [ ] Multi-platform — desktop, phone, wearable, home device
 - [ ] JARVIS — voice × async agent = personal AI assistant
@@ -84,7 +85,8 @@ python -m pip install -e '.[dev]'
 ### Run
 
 ```bash
-export DEEPSEEK_API_KEY=your-key
+# Interactive setup: choose provider/model and configure API key
+xiaoming-cli --init
 
 # Interactive chat (default: resumes latest session)
 xiaoming-cli
@@ -104,6 +106,9 @@ xiaoming "fix failing tests" --provider openai --model gpt-5
 ```text
 /help              List all commands
 /status            Show runtime status
+/config            Show effective configuration and config paths
+/doctor            Check provider, model, API key, and config status
+/init              Show setup guidance; use xiaoming-cli --init to reconfigure
 /context           Show context usage and token estimates
 /compact           Manually compact conversation history
 /tasks             List background tasks

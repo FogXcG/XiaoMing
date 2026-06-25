@@ -255,6 +255,7 @@ class TaskRecord:
     forked_loaded_skills: list[dict[str, str]] = field(default_factory=list)
     task_decision_log: list[str] = field(default_factory=list)
     worker_question_log: list[str] = field(default_factory=list)
+    last_worker_answer_decision: str = ""
     authorization_log: list[str] = field(default_factory=list)
     revision_attempts: int = 0
     parent_task_id: str | None = None
@@ -294,6 +295,7 @@ class TaskRecord:
             "forked_loaded_skills": list(self.forked_loaded_skills),
             "task_decision_log": list(self.task_decision_log),
             "worker_question_log": list(self.worker_question_log),
+            "last_worker_answer_decision": self.last_worker_answer_decision,
             "authorization_log": list(self.authorization_log),
             "revision_attempts": self.revision_attempts,
             "parent_task_id": self.parent_task_id,

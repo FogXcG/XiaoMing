@@ -77,6 +77,7 @@ class AsyncCoordinator:
         self._input_queue: queue.Queue[UserMessage] = queue.Queue()
         self._worker_events: queue.Queue[WorkerEvent] = queue.Queue()
         self._workers: dict[str, WorkerProcess] = {}
+        self._promoted_cancel_callbacks: dict[str, Callable[[], None]] = {}
         self._peer_reply_queues: dict[str, queue.Queue[str]] = {}
         self._verifier_workers: dict[str, WorkerProcess] = {}
         self._verifier_parent_ids: dict[str, str] = {}
@@ -133,11 +134,13 @@ class AsyncCoordinator:
             if question is None:
                 return ToolResult("reply_mailbox_message", "error", error=f"unknown pending mailbox message: {message_id}")
             self.mailbox.reply(message.message_id, normalized_answer)
+            message.metadata["decision"] = decision
             self._mark_mailbox_question_answered_locked(message.task_id)
             self._record_worker_answer_locked(question, normalized_answer, decision)
             if authorization_note.strip():
                 self._update_authorization_note_locked(question.task_id, authorization_note)
             self._persist()
+            self._state_changed.notify_all()
         self._send_to_worker(question.task_id, "answer_question", request_id=question.request_id, answer=normalized_answer, decision=decision)
         return ToolResult("reply_mailbox_message", "success", output=message_to_user or "Answer sent to worker.")
 
@@ -153,6 +156,66 @@ class AsyncCoordinator:
             self._apply_decision_locked(UserMessage(task_spec.goal), decision, emit_visible=False, task_spec=task_spec)
             self._persist()
             return ToolResult("schedule_background_task", "success", output=_decision_summary(decision))
+
+    def register_promoted_foreground_task(
+        self,
+        title: str,
+        original_request: str,
+        session_id: str,
+        cancel_callback: Callable[[], None] | None = None,
+    ) -> str:
+        task = TaskRecord(
+            title=title.strip() or "前台转后台任务",
+            original_request=original_request,
+            current_goal=original_request,
+            task_spec=TaskSpec.from_request(original_request, title=title),
+            status="running",
+            agent_type="promoted_foreground",
+            context_policy="promoted",
+        )
+        task.task_decision_log.append(f"promoted foreground session: {session_id}")
+        with self._lock:
+            self.registry.add(task)
+            if cancel_callback is not None:
+                self._promoted_cancel_callbacks[task.task_id] = cancel_callback
+            self._persist()
+        return task.task_id
+
+    def complete_promoted_foreground_task(self, task_id: str, status: str, summary: str) -> None:
+        with self._lock:
+            task = self.registry.get(task_id)
+            if task is None:
+                return
+            if task.status in TERMINAL_TASK_STATUSES:
+                return
+            terminal_status = "failed" if status == "failed" or task.last_worker_answer_decision == "denied" else "accepted"
+            task.transition(terminal_status, summary)
+            self.registry.clear_current_if(task_id)
+            self._promoted_cancel_callbacks.pop(task_id, None)
+            self._persist()
+            if terminal_status == "accepted":
+                self._notice(f"{task.title} 已完成：{summary}", task_id)
+            else:
+                self._notice(f"{task.title} 失败：{summary}", task_id)
+
+    def request_promoted_foreground_approval(self, task_id: str, action: str) -> bool:
+        with self._lock:
+            task = self.registry.get(task_id)
+            if task is None or task.status in TERMINAL_TASK_STATUSES:
+                return False
+            question = Question(task_id=task_id, kind="approval_request", prompt=action, purpose="promoted_foreground_tool_approval")
+            self._record_worker_question_locked(task, question)
+            message = self._record_mailbox_message_for_question_locked(task, question)
+            task.transition("needs_user", "waiting for user approval")
+            self._persist()
+            self._notice_pending_mailbox_question_locked(task_id)
+            while message.status == "pending" and task.status not in TERMINAL_TASK_STATUSES:
+                self._state_changed.wait(timeout=0.5)
+            answered_message = self.mailbox.get(message.message_id) or message
+            decision = str(answered_message.metadata.get("decision") or "").strip()
+            if decision in {"approved", "denied"}:
+                return decision == "approved"
+            return str(answered_message.reply or "").strip().lower() in {"y", "yes", "同意", "允许", "批准", "approved", "approve"}
 
     def tasks_text(self) -> str:
         with self._lock:
@@ -183,10 +246,14 @@ class AsyncCoordinator:
                 return ToolResult("talk_to_peer", "error", error=resolve_error)
             worker = self._workers.get(normalized_peer_id)
             if worker is None:
+                task = self.registry.get(normalized_peer_id)
+                if task is not None and task.agent_type == "promoted_foreground":
+                    return ToolResult("talk_to_peer", "success", output=_promoted_foreground_talk_reply(task))
                 external = self.external_sessions.get(normalized_peer_id)
                 if external is None:
+                    if task is not None:
+                        return ToolResult("talk_to_peer", "success", output=self._task_status_line_locked(task))
                     return ToolResult("talk_to_peer", "error", error=f"unknown peer: {normalized_peer_id}")
-                task = self.registry.get(normalized_peer_id)
                 if task is not None and task.status == "needs_user_decision":
                     return self._send_external_user_decision_locked(task, external, text)
                 external.status = "active"
@@ -248,7 +315,7 @@ class AsyncCoordinator:
             return peer_id, ""
         if peer_id in self.external_sessions:
             return peer_id, ""
-        candidates = set(self._workers) | set(self.external_sessions)
+        candidates = set(self._workers) | set(self.external_sessions) | {task.task_id for task in self.registry.list()}
         matches = sorted(task_id for task_id in candidates if task_id.startswith(peer_id))
         if len(matches) == 1:
             return matches[0], ""
@@ -575,6 +642,7 @@ class AsyncCoordinator:
         task = self.registry.get(question.task_id)
         if task is None:
             return
+        task.last_worker_answer_decision = decision
         task.worker_question_log.append(f"Answer to {question.request_id}: {answer} (decision={decision})")
 
     def _run_worker_events(self) -> None:
@@ -623,6 +691,7 @@ class AsyncCoordinator:
             decision = self._decide_worker_question_locked(task, question)
             if decision is not None and decision.decision in {"approved", "denied"}:
                 self.mailbox.reply(message.message_id, decision.answer)
+                task.last_worker_answer_decision = decision.decision
                 task.worker_question_log.append(
                     f"Auto-answer to {question.request_id}: {decision.answer} (decision={decision.decision}; reason={decision.reason})"
                 )
@@ -714,6 +783,9 @@ class AsyncCoordinator:
         worker = self._workers.get(task_id)
         if worker is not None:
             worker.terminate(timeout_seconds=5)
+        promoted_cancel = self._promoted_cancel_callbacks.pop(task_id, None)
+        if promoted_cancel is not None:
+            promoted_cancel()
         self._terminate_verifiers_for_task_locked(task_id)
         task.transition("cancelled", "用户请求取消。")
         self.registry.clear_current_if(task_id)
@@ -980,10 +1052,7 @@ class AsyncCoordinator:
             candidate = candidates[0] if candidates else None
         if candidate is None:
             return False
-        if not self._notice(candidate.text, candidate.task_id):
-            return False
-        self.mailbox.mark_presented(candidate.message_id)
-        return True
+        return self._notice(candidate.text, candidate.task_id, message_id=candidate.message_id)
 
     def _worker_notice(self, task: TaskRecord, event: WorkerEvent) -> str:
         if event.kind in {"completed", "failed", "cancelled"}:
@@ -1019,13 +1088,29 @@ class AsyncCoordinator:
         except ResponderError as exc:
             return f"Error: {exc}"
 
-    def _notice(self, message: str, task_id: str | None = None) -> bool:
+    def _notice(self, message: str, task_id: str | None = None, message_id: str | None = None) -> bool:
         if self.on_notice is None or not message:
             return False
         if task_id is not None and self._is_duplicate_notice_locked(task_id, message):
             return False
-        self.on_notice(CoordinatorNotice(message=message, task_id=task_id))
+        self.on_notice(CoordinatorNotice(message=message, task_id=task_id, message_id=message_id))
         return True
+
+    def mark_notice_presented(self, message_id: str) -> bool:
+        with self._lock:
+            message = self.mailbox.mark_presented(message_id)
+            if message is None:
+                return False
+            self._persist()
+            return True
+
+    def replay_pending_questions(self) -> int:
+        with self._lock:
+            emitted = 0
+            for candidate in self.mailbox.notice_candidates(self.registry, include_presented=True):
+                if self._notice(candidate.text, candidate.task_id, message_id=candidate.message_id):
+                    emitted += 1
+            return emitted
 
     def _persist(self) -> None:
         self.task_store.save_registry(self.registry)
@@ -1408,6 +1493,13 @@ def _task_status_line(task: TaskRecord, pending_questions: list[str] | None = No
         questions = "  pending: " + " | ".join(pending_questions)
     agent = f" [{task.agent_type}]" if task.agent_type and task.agent_type != "worker" else ""
     return f"{task.task_id[:8]}  {task.title}{agent}  {task.status}  {detail}{questions}"
+
+
+def _promoted_foreground_talk_reply(task: TaskRecord) -> str:
+    progress = task.last_progress.strip() or "暂无新的进展。"
+    if task.status in TERMINAL_TASK_STATUSES:
+        return f"{task.title} 当前状态：{task.status}。{progress}"
+    return f"{task.title} 当前仍在后台执行，状态：{task.status}。{progress}"
 
 
 def _follow_task_snapshot(task: TaskRecord, changed: bool) -> str:

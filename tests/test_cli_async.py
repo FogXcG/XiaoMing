@@ -1,12 +1,14 @@
 from argparse import Namespace
+import threading
 import time
 
 import pytest
 
 from xiaoming.async_runtime.events import CoordinatorNotice
 from xiaoming.async_runtime.scheduler import SchedulerDecision
-from xiaoming.cli import AsyncNoticeBuffer, ChatRuntime, build_loop, run_chat
+from xiaoming.cli import AsyncNoticeBuffer, ChatRuntime, TuiOutput, _handle_input, build_loop, run_chat
 from xiaoming.llm.types import LLMResponse, ToolCall
+from xiaoming.session import Session
 
 
 class FakeCoordinator:
@@ -18,6 +20,10 @@ class FakeCoordinator:
         self.quiet = False
         self.messages = []
         self.pending_question = False
+        self.promoted = []
+        self.completed = []
+        self.cancel_callbacks = {}
+        self.approvals = []
 
     def start(self):
         self.started = True
@@ -35,6 +41,20 @@ class FakeCoordinator:
         from xiaoming.tools.base import ToolResult
 
         return ToolResult("schedule_background_task", "success", output=f"scheduled: {text}")
+
+    def register_promoted_foreground_task(self, title, original_request, session_id, cancel_callback=None):
+        task_id = f"promoted-{len(self.promoted) + 1}"
+        self.promoted.append((task_id, title, original_request, session_id))
+        if cancel_callback is not None:
+            self.cancel_callbacks[task_id] = cancel_callback
+        return task_id
+
+    def complete_promoted_foreground_task(self, task_id, status, summary):
+        self.completed.append((task_id, status, summary))
+
+    def request_promoted_foreground_approval(self, task_id, action):
+        self.approvals.append((task_id, action))
+        return True
 
     def status_text(self):
         return "后台任务: 1\n待确认: 0"
@@ -90,6 +110,21 @@ class InterruptibleLoop:
                 time.sleep(0.01)
             return ""
         return f"主LLM回应：{task}"
+
+
+class BlockingLoop:
+    def __init__(self):
+        self.started = threading.Event()
+        self.release = threading.Event()
+        self.tasks = []
+        self.sessions = []
+
+    def run(self, task, session=None, on_event=None, should_cancel=None):
+        self.tasks.append(task)
+        self.sessions.append(session)
+        self.started.set()
+        self.release.wait(timeout=2)
+        return f"done {task}"
 
 
 class ToolCallingProvider:
@@ -262,6 +297,45 @@ def test_default_runtime_provides_async_context_summary_to_main_loop(tmp_path):
     runtime.async_coordinator = coordinator
 
     assert runtime._async_context_summary() == "Background tasks:\n- fake running"
+
+
+def test_handle_input_sets_active_user_input_before_running_agent(tmp_path):
+    runtime = ChatRuntime(workspace=tmp_path, args=_args(), coordinator_factory=lambda config, on_notice: FakeCoordinator(config, on_notice))
+    seen = []
+
+    def run_agent_task(user_input):
+        seen.append((user_input, runtime.active_user_input))
+
+    result = _handle_input(
+        "在后台使用codex开发一个简单的hello world网页",
+        runtime,
+        runtime.session,
+        runtime.loop,
+        TuiOutput(),
+        lambda text, end="\n": None,
+        run_agent_task,
+        None,
+        None,
+    )
+
+    assert result is None
+    assert seen == [
+        (
+            "在后台使用codex开发一个简单的hello world网页",
+            "在后台使用codex开发一个简单的hello world网页",
+        )
+    ]
+
+
+def test_async_notice_buffer_invalidates_ui_when_worker_question_arrives():
+    invalidations = []
+    buffer = AsyncNoticeBuffer(on_enqueue=lambda: invalidations.append(True))
+
+    buffer.enqueue(CoordinatorNotice("worker 需要确认"))
+
+    assert invalidations == [True]
+    notices = buffer.pull()
+    assert [notice.message for notice in notices] == ["worker 需要确认"]
 
 
 def test_cli_smoke_schedules_background_task_and_answers_worker_question(tmp_path):
@@ -466,6 +540,79 @@ def test_runtime_moves_foreground_task_to_background_with_existing_coordinator(t
     assert coordinator.messages
     assert "帮我修复 README" in str(coordinator.messages[0])
     assert "转为后台" in message
+
+
+def test_runtime_promotes_running_foreground_task_and_forks_main_session(tmp_path):
+    coordinator = FakeCoordinator(None, lambda notice: None)
+    runtime = ChatRuntime(workspace=tmp_path, args=_args(), coordinator_factory=lambda config, on_notice: coordinator)
+    runtime.async_coordinator = coordinator
+    runtime.session = Session(session_id=runtime.session_record.id)
+    runtime.session.input_items.append({"role": "user", "content": "之前的上下文"})
+    cancel_event = threading.Event()
+
+    runtime.begin_foreground_task("安装superpowers skill", cancel_event=cancel_event)
+    old_session_id = runtime.session.session_id
+    old_session = runtime.session
+
+    message = runtime.promote_foreground_to_worker()
+
+    assert "转为后台" in message
+    assert coordinator.promoted
+    task_id, title, original_request, promoted_session_id = coordinator.promoted[0]
+    assert task_id == "promoted-1"
+    assert title == "安装superpowers skill"
+    assert original_request == "安装superpowers skill"
+    assert promoted_session_id == old_session_id
+    assert runtime.session is not old_session
+    assert runtime.session.session_id != old_session_id
+    assert cancel_event.is_set() is False
+    assert any("foreground_promoted" in item.get("content", "") for item in runtime.session.input_items)
+    assert not any(item.get("role") == "assistant" for item in runtime.session.input_items)
+
+
+def test_handle_input_promotes_running_foreground_before_new_turn(tmp_path):
+    coordinator = FakeCoordinator(None, lambda notice: None)
+    runtime = ChatRuntime(workspace=tmp_path, args=_args(), coordinator_factory=lambda config, on_notice: coordinator)
+    runtime.async_coordinator = coordinator
+    runtime.session = Session(session_id=runtime.session_record.id)
+    cancel_event = threading.Event()
+    runtime.begin_foreground_task("前台任务", cancel_event=cancel_event)
+    output = TuiOutput()
+    started = []
+
+    _handle_input(
+        "新的问题",
+        runtime,
+        runtime.session,
+        runtime.loop,
+        output,
+        lambda text, end="\n": output.write(text, end=end),
+        lambda task: started.append((task, runtime.session.session_id)),
+        cancel_event,
+        None,
+    )
+
+    assert coordinator.promoted
+    assert started == [("新的问题", runtime.session.session_id)]
+    assert cancel_event.is_set() is False
+
+
+def test_promoted_foreground_approval_routes_to_coordinator(tmp_path):
+    coordinator = FakeCoordinator(None, lambda notice: None)
+    runtime = ChatRuntime(workspace=tmp_path, args=_args(), coordinator_factory=lambda config, on_notice: coordinator)
+    runtime.async_coordinator = coordinator
+    runtime.direct_approve_callback = lambda action: False
+    task = runtime.begin_foreground_task("前台任务", cancel_event=threading.Event())
+    task.status = "promoted"
+    task.worker_id = "task-1"
+    runtime.bind_foreground_task_to_current_thread(task)
+    try:
+        approved = runtime._route_approval("write file")
+    finally:
+        runtime.unbind_foreground_task_from_current_thread()
+
+    assert approved is True
+    assert coordinator.approvals == [("task-1", "write file")]
 
 
 def test_default_runtime_allows_web_search_while_background_task_active(tmp_path):

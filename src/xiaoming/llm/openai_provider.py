@@ -30,7 +30,7 @@ class OpenAIProvider:
                 tools=to_openai_tools(request.tools),
                 temperature=request.temperature,
                 max_output_tokens=request.max_output_tokens,
-                parallel_tool_calls=False,
+                parallel_tool_calls=True,
             )
         except ProviderCallError:
             raise

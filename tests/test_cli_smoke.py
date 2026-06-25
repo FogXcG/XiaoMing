@@ -1,7 +1,16 @@
 from argparse import Namespace
 import json
+import threading
+import time
 
-from xiaoming.cli import ChatRuntime, _print_progress, approve_action, build_instructions, build_loop, build_registry, build_universal_runtime_tools, discard_pending_terminal_input, enable_line_editing, parse_args, run_chat, run_loop_with_progress, tool_capability_hook
+from prompt_toolkit.buffer import Buffer
+from prompt_toolkit.buffer import CompletionState
+from prompt_toolkit.completion import Completion
+from prompt_toolkit.document import Document
+from prompt_toolkit.layout.menus import CompletionsMenu
+from prompt_toolkit.widgets import TextArea
+
+from xiaoming.cli import ChatRuntime, SlashCommandCompleter, TuiApprovalController, TuiOutput, _append_completed_tui_output, _apply_selected_completion, _format_tui_approval_action, _help_text, _make_output_window, _make_root_container, _print_progress, approve_action, build_instructions, build_loop, build_registry, build_universal_runtime_tools, discard_pending_terminal_input, enable_line_editing, parse_args, run_chat, run_initialization_wizard, run_loop_with_progress, should_run_initialization, tool_capability_hook
 from xiaoming.hooks import HookManager
 from xiaoming.progress import ProgressEvent
 
@@ -49,6 +58,12 @@ def test_parse_args_supports_disabling_stream():
     assert args.stream is False
 
 
+def test_parse_args_supports_init():
+    args = parse_args(["--init"])
+
+    assert args.init is True
+
+
 def test_parse_args_supports_session_resume_options():
     args = parse_args(["--continue"])
     resumed = parse_args(["--resume", "session-123"])
@@ -65,9 +80,81 @@ def test_parse_args_defaults_to_chat_when_no_task():
 
 
 def test_help_lists_dream_command():
-    from xiaoming.cli import _help_text
-
     assert "/dream" in _help_text()
+
+
+def test_slash_command_completer_lists_commands_for_slash():
+    completions = list(SlashCommandCompleter().get_completions(Document("/"), None))
+
+    assert any(completion.text == "/help" for completion in completions)
+    assert any(completion.text == "/model" for completion in completions)
+
+
+def test_slash_command_completer_filters_by_prefix():
+    completions = list(SlashCommandCompleter().get_completions(Document("/mo"), None))
+    texts = {completion.text for completion in completions}
+
+    assert "/model" in texts
+    assert "/model-timeout" in texts
+    assert "/help" not in texts
+
+
+def test_slash_command_completer_ignores_non_command_input():
+    completions = list(SlashCommandCompleter().get_completions(Document("hello /mo"), None))
+
+    assert completions == []
+
+
+def test_slash_command_completer_lists_permission_modes():
+    completions = list(SlashCommandCompleter().get_completions(Document("/permission "), None))
+    texts = {completion.text for completion in completions}
+
+    assert "/permission-mode default" in texts
+    assert "/permission-mode auto" in texts
+    assert "/permission-mode bypass" in texts
+
+
+def test_slash_command_completer_filters_permission_modes():
+    completions = list(SlashCommandCompleter().get_completions(Document("/permission a"), None))
+    texts = {completion.text for completion in completions}
+
+    assert texts == {"/permission-mode accept_edits", "/permission-mode auto"}
+
+
+def test_apply_selected_completion_applies_current_choice():
+    buffer = Buffer()
+    buffer.text = "/he"
+    buffer.cursor_position = len("/he")
+    buffer.complete_state = CompletionState(
+        buffer.document,
+        [Completion("/help", start_position=-3)],
+        complete_index=0,
+    )
+
+    assert _apply_selected_completion(buffer) is True
+    assert buffer.text == "/help"
+    assert buffer.complete_state is None
+
+
+def test_apply_selected_completion_ignores_unselected_menu():
+    buffer = Buffer()
+    buffer.text = "/"
+    buffer.cursor_position = 1
+    buffer.complete_state = CompletionState(
+        buffer.document,
+        [Completion("/help", start_position=-1)],
+        complete_index=None,
+    )
+
+    assert _apply_selected_completion(buffer) is False
+    assert buffer.text == "/"
+
+
+def test_help_text_is_generated_from_slash_command_catalog():
+    help_text = _help_text()
+
+    assert "/talk <peer-id> <message>" in help_text
+    assert "/skill install <github-tree-url>" in help_text
 
 
 def test_enable_line_editing_imports_readline():
@@ -118,6 +205,109 @@ def test_approve_action_denies_when_stdin_is_not_tty(monkeypatch):
     assert approve_action("touch file") is False
 
 
+def test_tui_approval_controller_waits_for_input_area_answer():
+    output = TuiOutput()
+    invalidations = []
+    controller = TuiApprovalController(output, lambda: invalidations.append(True))
+    result = []
+
+    thread = threading.Thread(target=lambda: result.append(controller.request("Tool: write_file")))
+    thread.start()
+    deadline = time.time() + 1
+    while time.time() < deadline and not controller.has_pending():
+        time.sleep(0.01)
+
+    text = output.flush()
+    assert "Tool: write_file" in text
+    assert "Approve? [y/N]" in text
+    assert invalidations
+
+    assert controller.consume_answer("y") is True
+    thread.join(timeout=1)
+    assert result == [True]
+
+
+def test_tui_approval_controller_omits_large_write_file_preview():
+    action = (
+        "Tool: write_file\n"
+        "File: index.html\n"
+        "Bytes: 5000\n"
+        "Lines: 120\n"
+        "Content preview:\n"
+        "<!DOCTYPE html>\n"
+        + "x" * 3000
+    )
+    output = TuiOutput()
+    controller = TuiApprovalController(output, lambda: None)
+    result = []
+
+    thread = threading.Thread(target=lambda: result.append(controller.request(action)))
+    thread.start()
+    deadline = time.time() + 1
+    while time.time() < deadline and not controller.has_pending():
+        time.sleep(0.01)
+
+    text = output.flush()
+    assert "Tool: write_file" in text
+    assert "File: index.html" in text
+    assert "Bytes: 5000" in text
+    assert "Lines: 120" in text
+    assert "Content preview: [omitted in TUI" in text
+    assert "<!DOCTYPE html>" not in text
+    assert "Approve? [y/N]" in text
+
+    assert controller.consume_answer("n") is False
+    thread.join(timeout=1)
+    assert result == [False]
+
+
+def test_format_tui_approval_action_limits_generic_long_actions():
+    action = "\n".join(f"line {index}" for index in range(100))
+
+    formatted = _format_tui_approval_action(action, max_chars=10_000, max_lines=5)
+
+    assert "line 0" in formatted
+    assert "line 4" in formatted
+    assert "line 5" not in formatted
+    assert "omitted 95 lines" in formatted
+
+
+def test_output_window_wraps_long_lines():
+    window = _make_output_window(Buffer())
+
+    assert window.wrap_lines() is True
+
+
+def test_root_container_includes_completion_menu():
+    root = _make_root_container(_make_output_window(Buffer()), TextArea())
+
+    assert any(isinstance(float_.content, CompletionsMenu) for float_ in root.floats)
+
+
+def test_chat_runtime_rebuild_passes_custom_approval_callback(tmp_path, monkeypatch):
+    monkeypatch.setenv("XIAOMING_HOME", str(tmp_path / "home"))
+    args = Namespace(
+        task=None,
+        provider=None,
+        model=None,
+        approval_mode="suggest",
+        permission_mode=None,
+        max_turns=None,
+        model_timeout_seconds=None,
+        stream=False,
+    )
+    runtime = ChatRuntime(workspace=tmp_path, args=args)
+    approvals = []
+    runtime.direct_approve_callback = lambda action: approvals.append(action) or True
+    runtime.loop = runtime._build_loop()
+
+    result = runtime.loop.registry.run("write_file", {"path": "note.txt", "content": "hello"})
+
+    assert result.status == "success"
+    assert approvals
+    assert (tmp_path / "note.txt").read_text() == "hello"
+
+
 def test_build_instructions_includes_agent_rules(tmp_path):
     (tmp_path / "AGENTS.md").write_text("Project rule.\n")
 
@@ -130,6 +320,16 @@ def test_build_instructions_includes_agent_rules(tmp_path):
     assert "pass only message and, when useful, a short task_name" in instructions
     assert "do not take over the same file-changing work in the foreground" in instructions
     assert "the worker will inspect the workspace" in instructions
+
+
+def test_build_instructions_encourages_parallel_read_only_tool_calls(tmp_path):
+    worker = build_instructions(tmp_path, role="worker")
+    orchestrator = build_instructions(tmp_path, role="orchestrator")
+
+    for instructions in (worker, orchestrator):
+        assert "When you need multiple independent read-only tool calls" in instructions
+        assert "web_search, web_fetch, search_code, read_file, and list_files" in instructions
+        assert "Do not batch write, shell mutation, patch, approval, or background task management tools" in instructions
 
 
 def test_build_instructions_does_not_hardcode_identity(tmp_path):
@@ -349,6 +549,30 @@ def test_chat_runtime_continue_restores_latest_session(monkeypatch, tmp_path):
     assert runtime.session_record.id == record.id
     assert [(item["role"], item["content"]) for item in runtime.session.input_items] == [("user", "first"), ("assistant", "ok")]
     assert runtime.session.input_items[0]["xiaoming"]["time"]
+
+
+def test_initialization_wizard_writes_config_and_secret(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setenv("XIAOMING_HOME", str(home))
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    prompts = iter(["", "", "sk-test"])
+    output = []
+
+    changed = run_initialization_wizard(workspace, input_fn=lambda prompt: next(prompts), output_fn=output.append, force=True)
+
+    assert changed is True
+    assert (home / "config.toml").read_text().splitlines()[:3] == ["[model]", 'provider = "deepseek"', 'model = "deepseek-v4-flash"']
+    assert (home / "secrets.env").read_text().count("DEEPSEEK_API_KEY=sk-test") == 1
+    assert __import__("os").environ["DEEPSEEK_API_KEY"] == "sk-test"
+
+
+def test_should_run_initialization_when_provider_key_missing(tmp_path, monkeypatch):
+    monkeypatch.setenv("XIAOMING_HOME", str(tmp_path / "home"))
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+
+    assert should_run_initialization(tmp_path) is True
 
 
 def test_chat_runtime_dream_context_delegates_to_loop(tmp_path):
@@ -665,6 +889,29 @@ def test_run_loop_with_progress_prints_text_delta_without_prefix(capsys):
 
     assert result == ""
     assert "".join(output_parts) == "Hello"
+
+
+def test_tui_output_can_complete_streaming_text_once():
+    output = TuiOutput()
+
+    output.write("好的，我来查一下", end="")
+    output.write("西安天气。", end="")
+    output.complete_streaming()
+
+    assert output.flush() == "好的，我来查一下西安天气。"
+    assert output.peek_streaming() == ""
+    assert output.flush() == ""
+
+
+def test_tui_refresh_replaces_visible_streaming_text_when_completed():
+    text, streaming_pos = _append_completed_tui_output(
+        "header\n好的，我来查一下西安天气。",
+        "好的，我来查一下西安天气。",
+        len("header\n"),
+    )
+
+    assert text == "header\n好的，我来查一下西安天气。"
+    assert streaming_pos == -1
 
 
 def test_run_loop_with_progress_supports_legacy_loop_without_event_callback():
