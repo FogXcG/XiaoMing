@@ -141,7 +141,7 @@ def test_skill_library_renders_available_skill_metadata_without_content(tmp_path
     assert "Available skills:" in rendered
     assert "frontend - Build UI." in rendered
     assert ".agents/skills/frontend/SKILL.md" in rendered
-    assert "load_skill" in rendered
+    assert "action=load" in rendered
     assert "Trigger rules:" in rendered
     assert "plain text" in rendered
     assert "skip an obvious skill" in rendered
@@ -177,9 +177,9 @@ def test_skill_library_includes_builtin_skill_installer(tmp_path: Path):
 
     assert skill is not None
     assert "Install skills" in skill.description
-    assert "install_skill" in skill.content
+    assert "action=\"install\"" in skill.content
     assert "openai/skills" not in skill.content
-    assert "load `find-skills`" in skill.content
+    assert "skill(action=\"load\", name=\"find-skills\")" in skill.content
     assert "Only use OpenAI skills" in skill.content
 
 

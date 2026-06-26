@@ -1,7 +1,9 @@
 from pathlib import Path
+import subprocess
 
 from xiaoming.permissions.engine import PermissionEngine
 from xiaoming.permissions.types import PermissionBehavior, PermissionMode, PermissionRule
+from xiaoming.tools.shell import ShellTool
 
 
 def test_shell_allows_read_only_pipeline_without_prompt(tmp_path: Path):
@@ -70,6 +72,25 @@ def test_shell_project_rule_can_allow_command_pattern(tmp_path: Path):
     decision = engine.decide_shell("npm run build")
 
     assert decision.behavior == PermissionBehavior.ALLOW
+
+
+def test_shell_tool_runs_commands_noninteractively(monkeypatch, tmp_path: Path):
+    captured = {}
+
+    def fake_run_noninteractive(command, **kwargs):
+        captured["command"] = command
+        captured["kwargs"] = kwargs
+        return subprocess.CompletedProcess(command, 0, stdout="ok\n", stderr="")
+
+    monkeypatch.setattr("xiaoming.tools.shell.run_noninteractive", fake_run_noninteractive)
+    tool = ShellTool(tmp_path, approval_mode="never", approve=lambda action: True)
+
+    result = tool.run({"command": "git clone https://example.test/private.git"})
+
+    assert result.status == "success"
+    assert result.output == "ok"
+    assert captured["kwargs"]["shell"] is True
+    assert captured["kwargs"]["capture_output"] is True
 
 
 def test_file_accept_edits_allows_workspace_edits(tmp_path: Path):

@@ -10,7 +10,8 @@ from prompt_toolkit.document import Document
 from prompt_toolkit.layout.menus import CompletionsMenu
 from prompt_toolkit.widgets import TextArea
 
-from xiaoming.cli import ChatRuntime, SlashCommandCompleter, TuiApprovalController, TuiOutput, _append_completed_tui_output, _apply_selected_completion, _format_tui_approval_action, _help_text, _make_output_window, _make_root_container, _print_progress, approve_action, build_instructions, build_loop, build_registry, build_universal_runtime_tools, discard_pending_terminal_input, enable_line_editing, parse_args, run_chat, run_initialization_wizard, run_loop_with_progress, should_run_initialization, tool_capability_hook
+from xiaoming.async_runtime.events import CoordinatorNotice
+from xiaoming.cli import ChatRuntime, SlashCommandCompleter, TuiApprovalController, TuiInputHistory, TuiOutput, _append_completed_tui_output, _append_tui_notices_to_buffer, _apply_selected_completion, _format_tui_approval_action, _help_text, _make_output_window, _make_root_container, _print_progress, _replace_input_buffer_text, approve_action, build_instructions, build_loop, build_registry, build_universal_runtime_tools, discard_pending_terminal_input, enable_line_editing, parse_args, run_chat, run_initialization_wizard, run_loop_with_progress, should_run_initialization, tool_capability_hook
 from xiaoming.hooks import HookManager
 from xiaoming.progress import ProgressEvent
 
@@ -148,6 +149,36 @@ def test_apply_selected_completion_ignores_unselected_menu():
 
     assert _apply_selected_completion(buffer) is False
     assert buffer.text == "/"
+
+
+def test_tui_input_history_navigates_previous_and_next():
+    history = TuiInputHistory()
+    history.append("first")
+    history.append("second")
+
+    assert history.previous("") == "second"
+    assert history.previous("second") == "first"
+    assert history.next("first") == "second"
+    assert history.next("second") == ""
+
+
+def test_tui_input_history_restores_draft_after_navigation():
+    history = TuiInputHistory()
+    history.append("old")
+
+    assert history.previous("draft") == "old"
+    assert history.next("old") == "draft"
+
+
+def test_replace_input_buffer_text_moves_cursor_to_end():
+    buffer = Buffer()
+    buffer.text = "old"
+    buffer.cursor_position = 0
+
+    _replace_input_buffer_text(buffer, "new command")
+
+    assert buffer.text == "new command"
+    assert buffer.cursor_position == len("new command")
 
 
 def test_help_text_is_generated_from_slash_command_catalog():
@@ -448,12 +479,12 @@ def test_tool_capability_hook_denies_read_only_mutation_tools():
 def test_tool_capability_hook_allows_skill_installer_tool_but_denies_shell():
     hook = tool_capability_hook("skill_install")
 
-    install = hook({"tool": "install_skill", "arguments": {"url": "https://github.com/obra/superpowers"}})
+    install = hook({"tool": "skill", "arguments": {"action": "install", "url": "https://github.com/obra/superpowers"}})
     shell = hook({"tool": "shell", "arguments": {"cmd": "git clone https://github.com/obra/superpowers"}})
 
     assert install is None
     assert shell["decision"] == "deny"
-    assert "install_skill" in shell["reason"]
+    assert "skill tool" in shell["reason"]
 
 
 def test_build_loop_loads_workspace_hooks(tmp_path):
@@ -912,6 +943,19 @@ def test_tui_refresh_replaces_visible_streaming_text_when_completed():
 
     assert text == "header\n好的，我来查一下西安天气。"
     assert streaming_pos == -1
+
+
+def test_append_tui_notices_scrolls_completion_notice_into_view():
+    class OutputBuffer:
+        text = "\n".join(f"line {index}" for index in range(200))
+        cursor_position = 0
+
+    output_buffer = OutputBuffer()
+
+    _append_tui_notices_to_buffer(output_buffer, [CoordinatorNotice("后台任务已完成")])
+
+    assert output_buffer.text.endswith("[xiaoming] 后台任务已完成")
+    assert output_buffer.cursor_position == len(output_buffer.text)
 
 
 def test_run_loop_with_progress_supports_legacy_loop_without_event_callback():

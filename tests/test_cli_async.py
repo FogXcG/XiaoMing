@@ -6,7 +6,7 @@ import pytest
 
 from xiaoming.async_runtime.events import CoordinatorNotice
 from xiaoming.async_runtime.scheduler import SchedulerDecision
-from xiaoming.cli import AsyncNoticeBuffer, ChatRuntime, TuiOutput, _handle_input, build_loop, run_chat
+from xiaoming.cli import AsyncNoticeBuffer, ChatRuntime, TuiOutput, WorkerThreadContext, _handle_input, build_loop, run_chat
 from xiaoming.llm.types import LLMResponse, ToolCall
 from xiaoming.session import Session
 
@@ -21,6 +21,8 @@ class FakeCoordinator:
         self.messages = []
         self.pending_question = False
         self.promoted = []
+        self.registered_workers = []
+        self.worker_events = []
         self.completed = []
         self.cancel_callbacks = {}
         self.approvals = []
@@ -42,19 +44,12 @@ class FakeCoordinator:
 
         return ToolResult("schedule_background_task", "success", output=f"scheduled: {text}")
 
-    def register_promoted_foreground_task(self, title, original_request, session_id, cancel_callback=None):
-        task_id = f"promoted-{len(self.promoted) + 1}"
-        self.promoted.append((task_id, title, original_request, session_id))
-        if cancel_callback is not None:
-            self.cancel_callbacks[task_id] = cancel_callback
-        return task_id
+    def register_running_worker_task(self, task, worker):
+        self.registered_workers.append((task, worker))
+        return task.task_id
 
-    def complete_promoted_foreground_task(self, task_id, status, summary):
-        self.completed.append((task_id, status, summary))
-
-    def request_promoted_foreground_approval(self, task_id, action):
-        self.approvals.append((task_id, action))
-        return True
+    def submit_worker_event(self, event):
+        self.worker_events.append(event)
 
     def status_text(self):
         return "后台任务: 1\n待确认: 0"
@@ -466,15 +461,14 @@ def test_default_runtime_exposes_universal_tool_schema(tmp_path):
     assert "search_code" in tool_names
     assert "web_fetch" in tool_names
     assert "git_status" in tool_names
-    assert "load_skill" in tool_names
-    assert "install_skill" in tool_names
+    assert "skill" in tool_names
     assert "shell" in tool_names
     assert "write_file" in tool_names
     assert "append_file" in tool_names
     assert "edit_file" in tool_names
     assert "apply_patch" in tool_names
     assert "write_file" not in runtime.loop.instructions
-    assert "load_skill" not in runtime.loop.instructions
+    assert "skill(action=\"load\"" not in runtime.loop.instructions
     assert runtime.loop.skill_library is None
 
 
@@ -483,23 +477,24 @@ def test_worker_loop_keeps_full_tool_surface(tmp_path):
 
     tool_names = {tool.name for tool in loop.registry.specs()}
 
-    assert "install_skill" in tool_names
+    assert "skill" in tool_names
     assert "shell" in tool_names
     assert "write_file" in tool_names
     assert "cancel_background_task" not in tool_names
 
 
-def test_build_loop_passes_custom_approval_callback_to_install_skill(tmp_path):
+def test_build_loop_passes_custom_approval_callback_to_skill_install(tmp_path):
     approvals = []
     args = _args()
     args.approval_mode = "suggest"
     loop = build_loop(tmp_path, args, approve=lambda action: approvals.append(action) or False)
 
-    result = loop.registry.run("install_skill", {"url": "https://github.com/acme/skills/tree/main/skills/frontend"})
+    result = loop.registry.run("skill", {"action": "install", "url": "https://github.com/acme/skills/tree/main/skills/frontend"})
 
     assert result.status == "denied"
     assert approvals
-    assert "Tool: install_skill" in approvals[0]
+    assert "Tool: skill" in approvals[0]
+    assert "Action: install" in approvals[0]
 
 
 @pytest.mark.skip(reason="prompt_toolkit requires TTY; pending UI test migration")
@@ -557,12 +552,12 @@ def test_runtime_promotes_running_foreground_task_and_forks_main_session(tmp_pat
     message = runtime.promote_foreground_to_worker()
 
     assert "转为后台" in message
-    assert coordinator.promoted
-    task_id, title, original_request, promoted_session_id = coordinator.promoted[0]
-    assert task_id == "promoted-1"
-    assert title == "安装superpowers skill"
-    assert original_request == "安装superpowers skill"
-    assert promoted_session_id == old_session_id
+    assert coordinator.registered_workers
+    worker_task, handle = coordinator.registered_workers[0]
+    assert worker_task.title == "安装superpowers skill"
+    assert worker_task.original_request == "安装superpowers skill"
+    assert worker_task.agent_type == "local_thread"
+    assert handle.task_id == worker_task.task_id
     assert runtime.session is not old_session
     assert runtime.session.session_id != old_session_id
     assert cancel_event.is_set() is False
@@ -592,27 +587,34 @@ def test_handle_input_promotes_running_foreground_before_new_turn(tmp_path):
         None,
     )
 
-    assert coordinator.promoted
+    assert coordinator.registered_workers
     assert started == [("新的问题", runtime.session.session_id)]
     assert cancel_event.is_set() is False
 
 
-def test_promoted_foreground_approval_routes_to_coordinator(tmp_path):
+def test_local_thread_worker_approval_routes_through_handle(tmp_path):
     coordinator = FakeCoordinator(None, lambda notice: None)
     runtime = ChatRuntime(workspace=tmp_path, args=_args(), coordinator_factory=lambda config, on_notice: coordinator)
     runtime.async_coordinator = coordinator
     runtime.direct_approve_callback = lambda action: False
     task = runtime.begin_foreground_task("前台任务", cancel_event=threading.Event())
-    task.status = "promoted"
-    task.worker_id = "task-1"
-    runtime.bind_foreground_task_to_current_thread(task)
+    message = runtime.promote_foreground_to_worker()
+    assert "转为后台" in message
+    worker_task, handle = coordinator.registered_workers[0]
+    runtime._worker_threads[threading.get_ident()] = WorkerThreadContext(worker_task.task_id, handle)
     try:
+        def approve_later():
+            while not coordinator.worker_events:
+                time.sleep(0.01)
+            event = coordinator.worker_events[0]
+            handle.send("answer_question", request_id=event.data["request_id"], answer="yes", decision="approved")
+        threading.Thread(target=approve_later, daemon=True).start()
         approved = runtime._route_approval("write file")
     finally:
-        runtime.unbind_foreground_task_from_current_thread()
+        runtime._worker_threads.pop(threading.get_ident(), None)
 
     assert approved is True
-    assert coordinator.approvals == [("task-1", "write file")]
+    assert coordinator.worker_events[0].kind == "approval_request"
 
 
 def test_default_runtime_allows_web_search_while_background_task_active(tmp_path):

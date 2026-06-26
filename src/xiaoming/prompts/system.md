@@ -22,7 +22,8 @@ and listing directories can also run in parallel with web searches.
 
 For specialized tasks (frontend frameworks, databases, DevOps, specific libraries,
 or unfamiliar technologies), load the built-in "find-skills" skill first. It guides
-you through discovering relevant skills from the web. Found skills are downloaded
-with fetch_skill and cached in .agents/skills/ for future use.
+you through discovering relevant skills from the web. Install discovered remote
+skills with `skill(action="install", ...)`, then load them with
+`skill(action="load", name=...)` before following their instructions.
 
 For common tasks you can handle with your base knowledge, skip skill search.

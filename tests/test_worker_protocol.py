@@ -194,7 +194,7 @@ def test_worker_task_prompt_treats_worker_as_skill_capable_not_subagent():
     assert "Title: t" in prompt
     assert "Goal: g" in prompt
     assert "independent, fully capable coding agent" not in prompt
-    assert "call load_skill before acting" not in prompt
+    assert "call skill with action=load before acting" not in prompt
     assert "report_task_result tool exactly once" not in prompt
 
 
@@ -223,9 +223,9 @@ def test_worker_protocol_context_treats_worker_as_skill_capable_not_subagent():
     assert "normal interactive coding session" in prompt
     assert "responsible for completing the assignment end to end" in prompt
     assert "skill instructions mention subagents or background agents" in prompt
-    assert "Use the native install_skill tool" in prompt
+    assert "Use the native skill tool with action=install" in prompt
     assert "Before inspecting files" in prompt
-    assert "call load_skill before acting" in prompt
+    assert "call skill with action=load before acting" in prompt
     assert "Loaded skill instructions guide how you approach the task" in prompt
     assert "If a loaded skill says to ask the user" in prompt
     assert "ask your user by calling the talk tool" in prompt

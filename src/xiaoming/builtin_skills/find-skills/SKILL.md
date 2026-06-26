@@ -56,8 +56,8 @@ Before recommending a skill:
 Before downloading, check if the skill is already installed locally:
 
 - Use `list_files` to check `.agents/skills/{name}/SKILL.md`
-- If cached → use `load_skill` with the skill name to load it into the session
-- If not → use `fetch_skill` with the GitHub tree URL to download and load it
+- If cached → use `skill(action="load", name=...)` to load it into the session
+- If not → use `skill(action="install", url=...)` with the GitHub tree URL to download it, then `skill(action="load", name=...)` to load it
 
 ### Step 5: Present to User
 
@@ -65,7 +65,7 @@ When you find relevant skills, present them with:
 
 1. The skill name and what it does
 2. The install count and source
-3. The GitHub URL needed for fetch_skill
+3. The GitHub URL needed for `skill(action="install")`
 
 Example:
 
@@ -81,10 +81,10 @@ It's ready to fetch. Shall I load it?
 
 If the user approves or the match is clear:
 
-- If not cached → `fetch_skill(url)` downloads, installs, and loads the skill into this session
-- If already cached in `.agents/skills/` → `load_skill(name)` loads it directly
+- If not cached → `skill(action="install", url=...)` downloads and installs the skill, then `skill(action="load", name=...)` loads it into this session
+- If already cached in `.agents/skills/` → `skill(action="load", name=...)` loads it directly
 
-For skills the user wants to keep permanently, you can also suggest `install_skill`.
+For skills the user wants to keep permanently, install them with `skill(action="install", ...)`.
 
 ## Common Skill Categories
 

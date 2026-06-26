@@ -26,7 +26,7 @@ def _superpowers_context(plugin_root: Path) -> BootstrapContext | None:
         "<EXTREMELY_IMPORTANT>\n"
         "You have superpowers.\n\n"
         "**Below is the full content of your 'superpowers:using-superpowers' skill - your introduction to using skills. "
-        "For all other skills, use the 'load_skill' tool:**\n\n"
+        "For all other skills, use the 'skill' tool with action='load':**\n\n"
         f"{content}\n"
         "</EXTREMELY_IMPORTANT>"
     )

@@ -10,6 +10,8 @@ from urllib.parse import quote, urlparse
 from urllib.request import Request, urlopen
 import zipfile
 
+from xiaoming.subprocess_utils import run_noninteractive
+
 
 Fetch = Callable[[str], bytes]
 
@@ -199,7 +201,7 @@ def _git_sparse_checkout(source: GithubSkillSource, paths: list[str], tmp_path: 
 
 
 def _run_git(args: list[str]) -> None:
-    result = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    result = run_noninteractive(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     if result.returncode != 0:
         raise SkillInstallError(result.stderr.strip() or "git command failed")
 

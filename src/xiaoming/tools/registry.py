@@ -67,12 +67,17 @@ class ToolRegistry:
             return f"run command: {command}" if command else "run shell command"
         if name == "git_status":
             return "check git status"
-        if name == "load_skill":
-            skill_name = args.get("name")
-            return f"load skill {skill_name}" if skill_name else "load skill instructions"
-        if name == "install_skill":
-            url = args.get("url")
-            return f"install skill from {url}" if url else "install skill"
+        if name == "skill":
+            action = args.get("action")
+            if action == "load":
+                skill_name = args.get("name")
+                return f"load skill {skill_name}" if skill_name else "load skill instructions"
+            if action == "install":
+                source = args.get("url") or args.get("repo")
+                return f"install skill from {source}" if source else "install skill"
+            if action == "list":
+                return "list skills"
+            return "manage skills"
         if name == "schedule_background_task":
             request = args.get("message") or args.get("request")
             return f"schedule background task: {request}" if request else "schedule background task"

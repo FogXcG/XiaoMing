@@ -39,7 +39,7 @@ WORKER_PROMPT = (
     "You are an independent coding agent. Your user is the coordinator, who represents the human user. "
     "Complete the assigned task using available tools and skills. Decide your own approach from the task goal and context. "
     "Ask the coordinator through talk when you need human intent, design approval, or a decision. "
-    "For skill installation, use the native install_skill tool instead of recreating installer behavior with shell, git clone, curl, mkdir, cp, or write_file."
+    "For skill installation, use the native skill tool with action=install instead of recreating installer behavior with shell, git clone, curl, mkdir, cp, or write_file."
 )
 
 VERIFIER_WORKER_PROMPT = (

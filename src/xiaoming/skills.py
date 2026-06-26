@@ -68,7 +68,7 @@ class SkillLibrary:
             "How to use skills:",
             "- Discovery: the list below is available in this session (name, description, and file path).",
             "- Trigger rules: if the user names a skill with $name or plain text, or the task clearly matches a skill description, use that skill for this turn.",
-            "- Before inspecting files, writing files, running commands, or otherwise acting on a matching task, call load_skill with the skill name to load full instructions.",
+            "- Before inspecting files, writing files, running commands, or otherwise acting on a matching task, call skill with action=load and the skill name to load full instructions.",
             "- Multiple matching skills: use the minimal set that covers the request, with process skills before implementation skills.",
             "- If you skip an obvious skill, briefly explain why before continuing.",
             "- Loaded skill instructions remain available for the session and should be followed when relevant.",

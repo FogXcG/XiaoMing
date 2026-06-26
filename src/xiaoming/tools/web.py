@@ -629,7 +629,7 @@ def _curl_get(url: str, headers: dict[str, str]) -> _HttpResponse:
     for key, value in headers.items():
         command.extend(["-H", f"{key}: {value}"])
     command.extend(["-w", marker + "%{url_effective}\t%{content_type}", url])
-    completed = subprocess.run(command, text=False, capture_output=True, timeout=DEFAULT_TIMEOUT_SECONDS + 5, check=False)
+    completed = subprocess.run(command, stdin=subprocess.DEVNULL, text=False, capture_output=True, timeout=DEFAULT_TIMEOUT_SECONDS + 5, check=False)
     if completed.returncode != 0:
         stderr = completed.stderr.decode("utf-8", errors="replace").strip()
         raise RuntimeError(stderr or f"curl failed with exit code {completed.returncode}")

@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 from pathlib import Path
-import subprocess
 from typing import Any
 
 from xiaoming.llm.types import ToolSpec
+from xiaoming.subprocess_utils import run_noninteractive
 from xiaoming.tools.base import ToolResult
 
 
@@ -26,7 +26,7 @@ class GitStatusTool:
         return ToolSpec(self.name, self.description, self.input_schema)
 
     def run(self, args: dict[str, Any]) -> ToolResult:
-        completed = subprocess.run(
+        completed = run_noninteractive(
             ["git", "status", "--short"],
             cwd=self.workspace,
             text=True,

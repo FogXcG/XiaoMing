@@ -33,11 +33,9 @@ class ScheduleBackgroundTaskTool:
         self,
         coordinator_getter: Callable[[], Any],
         turn_context_getter: Callable[[], str] | None = None,
-        promoted_task_getter: Callable[[], str] | None = None,
     ):
         self.coordinator_getter = coordinator_getter
         self.turn_context_getter = turn_context_getter
-        self.promoted_task_getter = promoted_task_getter
 
     @property
     def spec(self) -> ToolSpec:
@@ -48,17 +46,6 @@ class ScheduleBackgroundTaskTool:
         task_name = str(args.get("task_name") or "").strip()
         if not message:
             return ToolResult(self.name, "error", error="message is required")
-        promoted_task_id = self.promoted_task_getter() if self.promoted_task_getter is not None else ""
-        if promoted_task_id:
-            return ToolResult(
-                self.name,
-                "denied",
-                error=(
-                    "This run is already running as a background task "
-                    f"({promoted_task_id[:8]}). Do not schedule another worker for the same work; "
-                    "continue the current task directly."
-                ),
-            )
         task_spec = TaskSpec.from_request(message, title=task_name or None)
         turn_context = self.turn_context_getter() if self.turn_context_getter is not None else ""
         requested_executor = _requested_executor_from_turn_context(turn_context)

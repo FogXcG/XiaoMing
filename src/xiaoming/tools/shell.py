@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from pathlib import Path
-import subprocess
 from typing import Any
 
 from xiaoming.context.truncation import truncate_middle
@@ -10,6 +9,7 @@ from xiaoming.permissions.engine import PermissionEngine
 from xiaoming.permissions.types import PermissionBehavior
 from xiaoming.policy.approvals import ApprovalCallback
 from xiaoming.policy.shell_policy import ShellDecision, decide_shell
+from xiaoming.subprocess_utils import run_noninteractive
 from xiaoming.tools.base import ToolResult
 
 
@@ -42,7 +42,7 @@ class ShellTool:
             return ToolResult(self.name, "error", error=f"command rejected by policy: {command}")
         if decision == ShellDecision.APPROVE and not self.approve(summarize_shell_for_approval(command)):
             return ToolResult(self.name, "denied", error=f"command denied by user: {command}")
-        completed = subprocess.run(
+        completed = run_noninteractive(
             command,
             cwd=self.workspace,
             text=True,

@@ -93,7 +93,6 @@ class AgentLoop:
         if blocked:
             return blocked
         streamed_text = False
-        _log(self.logger, "info", "turn_started", user_task=summarize_text(user_task), session_items=session.item_count)
         prompt_runtime = PromptRuntime(self._current_instructions())
         runtime_context_text = self._runtime_context_text()
         self._maybe_auto_compact(session, prompt_runtime.base_instructions, user_task, runtime_context_text, on_event)
@@ -116,6 +115,15 @@ class AgentLoop:
             _record(self.session_recorder, session.session_id, "base_instructions", {"text": session.base_instructions})
             session.base_instructions_recorded = True
         active_turn = ActiveTurnState(compiled.pending_turn.turn_id)
+        _log(
+            self.logger,
+            "info",
+            "turn_started",
+            turn_id=active_turn.turn_id,
+            thread_id=threading.get_ident(),
+            user_task=summarize_text(user_task),
+            session_items=session.item_count,
+        )
         last_tool_result_signature: tuple[str, str, str, str, str] | None = None
         repeated_tool_result_count = 0
         per_turn_tool_counts: dict[str, int] = {}
@@ -147,6 +155,9 @@ class AgentLoop:
                 self.logger,
                 "info",
                 "model_call_started",
+                turn_id=active_turn.turn_id,
+                model_turn_index=_turn,
+                thread_id=threading.get_ident(),
                 model=self.model,
                 input_items=len(request.input_items),
                 tools=[tool.name for tool in request.tools],
@@ -185,6 +196,9 @@ class AgentLoop:
                 self.logger,
                 "info",
                 "model_call_finished",
+                turn_id=active_turn.turn_id,
+                model_turn_index=_turn,
+                thread_id=threading.get_ident(),
                 tool_calls=[call.name for call in response.tool_calls],
                 output_items=len(response.output_items),
                 has_message=bool(response.message),
@@ -276,7 +290,17 @@ class AgentLoop:
                 if description:
                     message += f" - {description}"
                 _emit(on_event, ProgressEvent("tool_started", message) if use_stream else message)
-                _log(self.logger, "info", "tool_call_started", tool=call.name, description=description, args=call.args)
+                _log(
+                    self.logger,
+                    "info",
+                    "tool_call_started",
+                    turn_id=active_turn.turn_id,
+                    call_id=call.id,
+                    thread_id=threading.get_ident(),
+                    tool=call.name,
+                    description=description,
+                    args=call.args,
+                )
                 _record(self.session_recorder, session.session_id, "tool_call", {"call_id": call.id, "tool": call.name, "arguments": call.args, "description": description})
                 pre_hook = self._run_pre_tool_use_hook(session, call)
                 if call.name == "background_tasks_status" and per_turn_tool_counts.get(call.name, 0) >= 1:
@@ -319,7 +343,17 @@ class AgentLoop:
                     run_single_tool_call(runnable[0])
                     return
                 group_id = f"{active_turn.turn_id}:parallel:{runnable[0].call.id}"
-                _log(self.logger, "info", "parallel_tool_group_started", group_id=group_id, tools=[state.call.name for state in runnable], count=len(runnable))
+                _log(
+                    self.logger,
+                    "info",
+                    "parallel_tool_group_started",
+                    turn_id=active_turn.turn_id,
+                    thread_id=threading.get_ident(),
+                    group_id=group_id,
+                    tools=[state.call.name for state in runnable],
+                    call_ids=[state.call.id for state in runnable],
+                    count=len(runnable),
+                )
                 max_workers = max(1, min(self.max_parallel_tool_calls, len(runnable)))
                 with ThreadPoolExecutor(max_workers=max_workers) as executor:
                     futures = [(state, executor.submit(self.registry.run, state.call.name, state.call.args)) for state in runnable]
@@ -330,7 +364,17 @@ class AgentLoop:
                             _record_interrupted_tool_call(self.session_recorder, session, state.call, self.registry)
                             abort_interrupted_tool_call(state.call)
                             raise
-                _log(self.logger, "info", "parallel_tool_group_finished", group_id=group_id, tools=[state.call.name for state in runnable], count=len(runnable))
+                _log(
+                    self.logger,
+                    "info",
+                    "parallel_tool_group_finished",
+                    turn_id=active_turn.turn_id,
+                    thread_id=threading.get_ident(),
+                    group_id=group_id,
+                    tools=[state.call.name for state in runnable],
+                    call_ids=[state.call.id for state in runnable],
+                    count=len(runnable),
+                )
 
             def finalize_tool_call(state: _ToolCallState) -> str | None:
                 nonlocal background_status_snapshot_text, last_tool_result_signature, repeated_tool_result_count
@@ -339,7 +383,17 @@ class AgentLoop:
                 post_hook = self._run_post_tool_use_hook(session, call, result)
                 if post_hook.additional_context:
                     session.stage_next_model_context(post_hook.additional_context, "PostToolUse")
-                _log(self.logger, "info", "tool_call_finished", tool=call.name, status=result.status, error=result.error)
+                _log(
+                    self.logger,
+                    "info",
+                    "tool_call_finished",
+                    turn_id=active_turn.turn_id,
+                    call_id=call.id,
+                    thread_id=threading.get_ident(),
+                    tool=call.name,
+                    status=result.status,
+                    error=result.error,
+                )
                 _record(self.session_recorder, session.session_id, "tool_result", {"call_id": call.id, "tool": call.name, "status": result.status, "output": result.output, "error": result.error})
                 status = result.status
                 if result.error:
@@ -358,21 +412,13 @@ class AgentLoop:
                     }
                 )
                 session.input_items.append(tool_output_item)
-                if call.name == "load_skill" and result.status == "success":
+                if call.name == "skill" and str(call.args.get("action") or "").strip().lower() == "load" and result.status == "success":
                     skill_name = str(call.args.get("name") or "").strip()
                     loaded = _loaded_skill_from_library(self.skill_library, skill_name)
                     if loaded is not None:
                         session.remember_loaded_skill(loaded)
                         _log(self.logger, "info", "loaded_skill_remembered", skill=loaded.name, path=loaded.path, content_hash=loaded.content_hash)
                         _record(self.session_recorder, session.session_id, "loaded_skill", loaded.to_payload())
-                if call.name == "fetch_skill" and result.status == "success":
-                    skill_name = _extract_skill_name_from_fetch_result(result.output)
-                    if skill_name:
-                        loaded = _loaded_skill_from_library(self.skill_library, skill_name)
-                        if loaded is not None:
-                            session.remember_loaded_skill(loaded)
-                            _log(self.logger, "info", "fetch_skill_loaded", skill=loaded.name, path=loaded.path, content_hash=loaded.content_hash)
-                            _record(self.session_recorder, session.session_id, "loaded_skill", loaded.to_payload())
                 _record(
                     self.session_recorder,
                     session.session_id,
@@ -856,13 +902,6 @@ def _loaded_skill_from_library(library: SkillLibrary | None, requested_name: str
         content=skill.content,
         path=str(skill.path) if skill.path is not None else "",
     )
-
-
-def _extract_skill_name_from_fetch_result(output: str) -> str | None:
-    """Extract the skill name from a <fetch_skill_result> block."""
-    import re
-    match = re.search(r"<name>(.*?)</name>", output)
-    return match.group(1).strip() if match else None
 
 
 def _log(logger: XiaomingLogger | None, level: str, event: str, **fields) -> None:

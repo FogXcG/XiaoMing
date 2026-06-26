@@ -22,12 +22,13 @@ from prompt_toolkit.styles import Style
 from prompt_toolkit.widgets import TextArea
 
 from xiaoming.async_runtime.coordinator import AsyncCoordinator, CoordinatorConfig
-from xiaoming.async_runtime.events import CoordinatorNotice
+from xiaoming.async_runtime.events import CoordinatorNotice, WorkerEvent
 from xiaoming.async_runtime.leases import WriteLeaseCallback
+from xiaoming.async_runtime.local_thread_worker import ForegroundWorkerHandle
 from xiaoming.async_runtime.question_decider import LLMWorkerQuestionDecider
 from xiaoming.async_runtime.responder import LLMMessagingResponder
 from xiaoming.async_runtime.scheduler import LLMScheduler
-from xiaoming.async_runtime.tasks import TaskSpec
+from xiaoming.async_runtime.tasks import TaskRecord, TaskSpec
 from xiaoming.agent_loop import AgentLoop
 from xiaoming.bootstrap import discover_bootstrap_contexts
 from xiaoming.checkpoints import CheckpointStore
@@ -52,14 +53,12 @@ from xiaoming.tools.background_task import BackgroundTasksStatusTool, CancelBack
 from xiaoming.tools.base import Tool, ToolResult
 from xiaoming.tools.edit_file import EditFileTool
 from xiaoming.tools.git_status import GitStatusTool
-from xiaoming.tools.fetch_skill import FetchSkillTool
-from xiaoming.tools.install_skill import InstallSkillTool
 from xiaoming.tools.list_files import ListFilesTool
-from xiaoming.tools.load_skill import LoadSkillTool
 from xiaoming.tools.read_file import ReadFileTool
 from xiaoming.tools.registry import ToolRegistry
 from xiaoming.tools.search_code import SearchCodeTool
 from xiaoming.tools.shell import ShellTool
+from xiaoming.tools.skill import SkillTool
 from xiaoming.tools.talk import TalkCallback, TalkTool
 from xiaoming.tools.web import WebFetchTool, WebSearchTool
 from xiaoming.tools.write_file import WriteFileTool
@@ -145,10 +144,8 @@ READ_ONLY_ALLOWED_TOOLS = {
     "search_code",
     "web_fetch",
     "git_status",
-    "load_skill",
     "talk",
 }
-SKILL_INSTALL_ALLOWED_TOOLS = READ_ONLY_ALLOWED_TOOLS | {"install_skill"}
 CapabilityProfile = str | Callable[[], str]
 
 
@@ -170,6 +167,14 @@ class ForegroundTask:
     session_id: str | None = None
     boundary_snapshot: SessionSnapshot | None = None
     cancel_event: threading.Event | None = None
+    thread_id: int | None = None
+
+
+@dataclass
+class WorkerThreadContext:
+    task_id: str
+    handle: ForegroundWorkerHandle
+    capability_profile: str = "full"
 
 
 @dataclass
@@ -245,10 +250,9 @@ def build_universal_runtime_tools(
     coordinator_getter: Callable[[], object | None],
     talk_callback: TalkCallback,
     turn_context_getter: Callable[[], str] | None = None,
-    promoted_task_getter: Callable[[], str] | None = None,
 ) -> list[Tool]:
     return [
-        ScheduleBackgroundTaskTool(coordinator_getter, turn_context_getter=turn_context_getter, promoted_task_getter=promoted_task_getter),
+        ScheduleBackgroundTaskTool(coordinator_getter, turn_context_getter=turn_context_getter),
         BackgroundTasksStatusTool(coordinator_getter),
         FollowBackgroundTaskTool(coordinator_getter),
         CancelBackgroundTaskTool(coordinator_getter),
@@ -269,13 +273,17 @@ def tool_capability_hook(profile: CapabilityProfile) -> Callable[[dict], dict | 
         if normalized == "foreground" or normalized == "orchestrator":
             return None
         if normalized in {"read_only", "verify"}:
+            if tool == "skill" and _skill_action_allowed(payload, {"load", "list"}):
+                return None
             if tool in READ_ONLY_ALLOWED_TOOLS:
                 return None
             return {"decision": "deny", "reason": "This worker profile is read-only; use read/search tools or talk, and do not modify files, run shell commands, install skills, or manage background tasks."}
         if normalized == "skill_install":
-            if tool in SKILL_INSTALL_ALLOWED_TOOLS:
+            if tool == "skill" and _skill_action_allowed(payload, {"load", "list", "install"}):
                 return None
-            return {"decision": "deny", "reason": "This worker installs skills through install_skill; do not use shell, git clone, write tools, or background task management tools."}
+            if tool in READ_ONLY_ALLOWED_TOOLS:
+                return None
+            return {"decision": "deny", "reason": "This worker installs skills through the skill tool; do not use shell, git clone, write tools, or background task management tools."}
         if tool in {"schedule_background_task", "background_tasks_status", "follow_background_task", "cancel_background_task", "talk_to_peer", "reply_mailbox_message"}:
             return {"decision": "deny", "reason": "Background workers cannot manage the coordinator's task queue; use talk when you need coordinator or user input."}
         return None
@@ -286,6 +294,11 @@ def tool_capability_hook(profile: CapabilityProfile) -> Callable[[dict], dict | 
 def _resolve_capability_profile(profile: CapabilityProfile) -> str:
     value = profile() if callable(profile) else profile
     return (value or "full").strip()
+
+
+def _skill_action_allowed(payload: dict, allowed_actions: set[str]) -> bool:
+    action = str((payload.get("arguments") or {}).get("action") or "").strip().lower()
+    return action in allowed_actions
 
 
 class CapabilityGuardedTool:
@@ -398,11 +411,17 @@ def build_registry(
         )
     if include_shell_tool:
         tools.append(ShellTool(workspace, approval_mode=approval_mode, approve=approve, permission_engine=permission_engine))
-    if skill_library is not None and include_skill_install_tool:
-        tools.append(InstallSkillTool(workspace, skill_library, approval_mode=approval_mode, approve=approve))
-        tools.append(FetchSkillTool(workspace, skill_library))
-    if include_load_skill_tool and skill_library is not None and skill_library.skills:
-        tools.append(LoadSkillTool(skill_library, workspace=workspace))
+    if skill_library is not None and (include_skill_install_tool or include_load_skill_tool):
+        tools.append(
+            SkillTool(
+                workspace,
+                skill_library,
+                approval_mode=approval_mode,
+                approve=approve,
+                allow_install=include_skill_install_tool,
+                allow_load=include_load_skill_tool,
+            )
+        )
     if extra_tools:
         tools.extend(extra_tools)
     if tool_wrapper is not None:
@@ -534,6 +553,7 @@ class ChatRuntime:
         self.active_user_input: str = ""
         self.direct_approve_callback: Callable[[str], bool] = approve_action
         self._foreground_tasks_by_thread: dict[int, ForegroundTask] = {}
+        self._worker_threads: dict[int, WorkerThreadContext] = {}
         self.session_record, self.resumed_existing_session = self._select_session()
         self.session = self._load_session(self.session_record)
         self._ensure_bootstrap_contexts()
@@ -570,12 +590,11 @@ class ChatRuntime:
                         coordinator_getter=lambda: self.async_coordinator,
                         talk_callback=unavailable_talk_callback,
                         turn_context_getter=lambda: self.active_user_input,
-                        promoted_task_getter=self.current_promoted_foreground_task_id,
                     ),
                     approve=self._route_approval,
                     pending_worker_questions=self._pending_worker_questions_for_input,
                     include_skill_context=False,
-                    runtime_context_provider=self._async_context_summary,
+                    runtime_context_provider=self._runtime_context_summary,
                     role="orchestrator",
                     capability_profile=self.current_capability_profile,
                 )
@@ -822,6 +841,9 @@ class ChatRuntime:
         return self.async_coordinator.pending_questions_text()
 
     def current_capability_profile(self) -> str:
+        worker_context = self._worker_threads.get(threading.get_ident())
+        if worker_context is not None:
+            return worker_context.capability_profile
         if self.foreground_task is not None and self.foreground_task.status == "running":
             return "foreground"
         return "orchestrator"
@@ -835,34 +857,58 @@ class ChatRuntime:
             cancel_event=cancel_event,
         )
         self.foreground_task = task
-        self.logger.info("foreground_task_started", task_name=task.task_name)
+        self.logger.info(
+            "foreground_task_started",
+            task_name=task.task_name,
+            chat_session_id=task.session_id,
+            thread_id=threading.get_ident(),
+        )
         return task
 
     def bind_foreground_task_to_current_thread(self, task: ForegroundTask) -> None:
-        self._foreground_tasks_by_thread[threading.get_ident()] = task
+        thread_id = threading.get_ident()
+        task.thread_id = thread_id
+        self._foreground_tasks_by_thread[thread_id] = task
+        self.logger.info(
+            "foreground_task_bound",
+            task_name=task.task_name,
+            thread_id=thread_id,
+            status=task.status,
+            worker_id=task.worker_id,
+        )
 
     def unbind_foreground_task_from_current_thread(self) -> None:
-        self._foreground_tasks_by_thread.pop(threading.get_ident(), None)
+        thread_id = threading.get_ident()
+        self._foreground_tasks_by_thread.pop(thread_id, None)
+        context = self._worker_threads.get(thread_id)
+        if context is None:
+            self.logger.info("foreground_task_unbound", thread_id=thread_id, worker_context=False)
+            return
+        task = self.foreground_task
+        if task is None or task.worker_id != context.task_id:
+            self._worker_threads.pop(thread_id, None)
+            self.logger.info("foreground_task_unbound", thread_id=thread_id, worker_context=True, worker_id=context.task_id, worker_context_cleared=True)
+            return
+        self.logger.info("foreground_task_unbound", thread_id=thread_id, worker_context=True, worker_id=context.task_id, worker_context_cleared=False)
 
     def _route_approval(self, action: str) -> bool:
-        task = self._foreground_tasks_by_thread.get(threading.get_ident())
-        if task is not None and task.status == "promoted" and task.worker_id and self.async_coordinator is not None:
-            request = getattr(self.async_coordinator, "request_promoted_foreground_approval", None)
-            if callable(request):
-                return bool(request(task.worker_id, action))
+        worker_context = self._worker_threads.get(threading.get_ident())
+        if worker_context is not None:
+            return worker_context.handle.request_approval(action)
         return self.direct_approve_callback(action)
-
-    def current_promoted_foreground_task_id(self) -> str:
-        task = self._foreground_tasks_by_thread.get(threading.get_ident())
-        if task is None or task.status != "promoted":
-            return ""
-        return task.worker_id or ""
 
     def finish_foreground_task(self, status: str = "completed") -> None:
         if self.foreground_task is None:
             return
         self.foreground_task.status = status
-        self.logger.info("foreground_task_finished", task_name=self.foreground_task.task_name, status=status)
+        self.logger.info(
+            "foreground_task_finished",
+            task_name=self.foreground_task.task_name,
+            status=status,
+            thread_id=threading.get_ident(),
+            bound_thread_id=self.foreground_task.thread_id,
+            worker_id=self.foreground_task.worker_id,
+        )
         self.foreground_task = None
 
     def move_foreground_task_to_background(self) -> str:
@@ -888,28 +934,40 @@ class ChatRuntime:
         if self.async_coordinator is None:
             return ""
         task = self.foreground_task
-        register = getattr(self.async_coordinator, "register_promoted_foreground_task", None)
-        if not callable(register):
+        register = getattr(self.async_coordinator, "register_running_worker_task", None)
+        submit_worker_event = getattr(self.async_coordinator, "submit_worker_event", None)
+        if not callable(register) or not callable(submit_worker_event):
             return ""
-        worker_id = register(
-            task.task_name,
-            task.original_message,
-            task.session_id or self.session.session_id or "",
-            cancel_callback=task.cancel_event.set if task.cancel_event is not None else None,
+        worker_task = TaskRecord(
+            title=task.task_name,
+            original_request=task.original_message,
+            current_goal=task.original_message,
+            task_spec=TaskSpec.from_request(task.original_message, title=task.task_name),
+            status="running",
+            agent_type="local_thread",
+            context_policy="forked",
         )
+        cancel_event = task.cancel_event or threading.Event()
+        task.cancel_event = cancel_event
+        handle = ForegroundWorkerHandle(worker_task.task_id, submit_worker_event, cancel_event)
+        worker_id = register(worker_task, handle)
         task.worker_id = str(worker_id)
-        task.status = "promoted"
+        task.status = "worker"
+        if task.thread_id is not None:
+            self._worker_threads[task.thread_id] = WorkerThreadContext(task_id=task.worker_id, handle=handle)
         self._fork_main_session_from_foreground(task)
-        self.logger.info("foreground_task_promoted", task_name=task.task_name, worker_id=task.worker_id)
+        self.logger.info(
+            "foreground_task_promoted",
+            task_name=task.task_name,
+            worker_id=task.worker_id,
+            source_thread_id=task.thread_id,
+            current_thread_id=threading.get_ident(),
+        )
         self.foreground_task = None
         return f"当前任务已转为后台继续处理：{task.task_name}"
 
-    def complete_promoted_foreground_task(self, task_id: str, status: str, summary: str) -> None:
-        if self.async_coordinator is None:
-            return
-        complete = getattr(self.async_coordinator, "complete_promoted_foreground_task", None)
-        if callable(complete):
-            complete(task_id, status, summary)
+    def worker_context_for_current_thread(self) -> WorkerThreadContext | None:
+        return self._worker_threads.get(threading.get_ident())
 
     def _fork_main_session_from_foreground(self, task: ForegroundTask) -> None:
         snapshot = task.boundary_snapshot or _foreground_boundary_snapshot(self.session, task.original_message)
@@ -928,6 +986,12 @@ class ChatRuntime:
         if context_summary is None:
             return None
         return context_summary()
+
+    def _runtime_context_summary(self) -> str | None:
+        worker_context = self._worker_threads.get(threading.get_ident())
+        if worker_context is not None:
+            return _worker_thread_runtime_context(worker_context)
+        return self._async_context_summary()
 
 
 def _foreground_task_name(user_input: str) -> str:
@@ -982,6 +1046,23 @@ def _ends_with_user_message(input_items: list[dict], user_input: str) -> bool:
         return False
     item = input_items[-1]
     return item.get("role") == "user" and str(item.get("content") or "") == user_input
+
+
+def _worker_thread_runtime_context(context: WorkerThreadContext) -> str:
+    lines = [
+        "<worker_transition>",
+        f"You are now a background worker for task_id={context.task_id}.",
+        "Continue the original task. Do not act as the primary user-facing coordinator.",
+        "Ask for decisions through normal tool approval or talk; do not manage the background task queue.",
+        "</worker_transition>",
+    ]
+    inbox = context.handle.drain_inbox()
+    if inbox:
+        lines.append("<worker_inbox>")
+        for item in inbox:
+            lines.append(str(item))
+        lines.append("</worker_inbox>")
+    return "\n".join(lines)
 
 
 def _foreground_background_message(user_input: str) -> str:
@@ -1216,6 +1297,44 @@ def _apply_selected_completion(buffer: Buffer) -> bool:
     return True
 
 
+class TuiInputHistory:
+    def __init__(self) -> None:
+        self._entries: list[str] = []
+        self._cursor: int | None = None
+        self._draft = ""
+
+    def append(self, text: str) -> None:
+        value = text.strip()
+        if value and (not self._entries or self._entries[-1] != value):
+            self._entries.append(value)
+        self._cursor = None
+        self._draft = ""
+
+    def previous(self, current: str) -> str:
+        if not self._entries:
+            return current
+        if self._cursor is None:
+            self._draft = current
+            self._cursor = len(self._entries)
+        if self._cursor > 0:
+            self._cursor -= 1
+        return self._entries[self._cursor]
+
+    def next(self, current: str) -> str:
+        if self._cursor is None:
+            return current
+        if self._cursor < len(self._entries) - 1:
+            self._cursor += 1
+            return self._entries[self._cursor]
+        self._cursor = None
+        return self._draft
+
+
+def _replace_input_buffer_text(buffer: Buffer, text: str) -> None:
+    buffer.text = text
+    buffer.cursor_position = len(text)
+
+
 
 def run_chat(runtime_or_loop) -> int:
     """Run the interactive chat loop with a prompt_toolkit terminal UI."""
@@ -1254,6 +1373,7 @@ def run_chat(runtime_or_loop) -> int:
         height=1,
         wrap_lines=False,
     )
+    input_history = TuiInputHistory()
 
     root_container = _make_root_container(output_window, input_area)
 
@@ -1265,7 +1385,7 @@ def run_chat(runtime_or_loop) -> int:
         layout=Layout(root_container, focused_element=input_area),
         key_bindings=kb,
         style=style,
-        mouse_support=True,
+        mouse_support=False,
         full_screen=True,
     )
 
@@ -1284,6 +1404,14 @@ def run_chat(runtime_or_loop) -> int:
             _invalidate_ui()
         else:
             cancel_event.set()
+
+    @kb.add("c-d")
+    def _(event):
+        if input_area.text:
+            input_area.buffer.delete()
+            return
+        _stop_refresh.set()
+        event.app.exit()
 
     @kb.add("pageup")
     @kb.add("c-up")
@@ -1334,11 +1462,13 @@ def run_chat(runtime_or_loop) -> int:
             output_buffer.cursor_position = len(output_buffer.text)
 
         notices = async_notices.pull()
-        for notice in notices:
+        if notices:
             _streaming_pos = -1
-            output_buffer.text += f"\n[xiaoming] {notice.message}"
-            if notice.message_id and runtime is not None and runtime.async_coordinator is not None:
-                runtime.async_coordinator.mark_notice_presented(notice.message_id)
+            _append_tui_notices_to_buffer(output_buffer, notices)
+            if runtime is not None and runtime.async_coordinator is not None:
+                for notice in notices:
+                    if notice.message_id:
+                        runtime.async_coordinator.mark_notice_presented(notice.message_id)
 
     def _before_render(_app):
         _refresh_ui()
@@ -1380,18 +1510,20 @@ def run_chat(runtime_or_loop) -> int:
                     answer = run_loop_with_progress(
                         runtime.loop, user_input,
                         session=active_session,
-                        on_event=lambda message: None if foreground_task.status == "promoted" else _on_progress_emit(message),
+                        on_event=lambda message: None if foreground_task.status == "worker" else _on_progress_emit(message),
                         should_cancel=runner_cancel_event.is_set,
                     )
-                    if foreground_task.status == "promoted" and foreground_task.worker_id:
-                        runtime.complete_promoted_foreground_task(foreground_task.worker_id, "completed", answer or "Task completed.")
+                    worker_context = runtime.worker_context_for_current_thread()
+                    if worker_context is not None:
+                        worker_context.handle.emit_completed(answer or "Task completed.")
                     else:
                         runtime.finish_foreground_task("completed")
                         output.complete_streaming()
                         _invalidate_ui()
                 except Exception:
-                    if foreground_task.status == "promoted" and foreground_task.worker_id:
-                        runtime.complete_promoted_foreground_task(foreground_task.worker_id, "failed", "后台任务失败。")
+                    worker_context = runtime.worker_context_for_current_thread()
+                    if worker_context is not None:
+                        worker_context.handle.emit_failed("后台任务失败。")
                     else:
                         runtime.finish_foreground_task("failed")
                     raise
@@ -1432,12 +1564,16 @@ def run_chat(runtime_or_loop) -> int:
         buffer = input_area.buffer
         if buffer.complete_state is not None:
             buffer.complete_next()
+            return
+        _replace_input_buffer_text(buffer, input_history.next(buffer.text))
 
     @kb.add("up")
     def _(event):
         buffer = input_area.buffer
         if buffer.complete_state is not None:
             buffer.complete_previous()
+            return
+        _replace_input_buffer_text(buffer, input_history.previous(buffer.text))
 
     # Enter key: echo input + run agent
     @kb.add("enter")
@@ -1454,10 +1590,12 @@ def run_chat(runtime_or_loop) -> int:
         input_area.text = ""
         approval = approval_controller.consume_answer(user_input)
         if approval is not None:
+            input_history.append(user_input)
             output.write(f">>> {user_input}")
             output.write("Approved." if approval else "Denied.")
             _invalidate_ui()
             return
+        input_history.append(user_input)
         output.write(f">>> {user_input}")
         _invalidate_ui()
         result = _handle_input(user_input, runtime, session, loop,
@@ -1482,6 +1620,17 @@ def run_chat(runtime_or_loop) -> int:
 def _print_async_notice(notice: CoordinatorNotice) -> None:
     """Default handler for async notices (used outside prompt_toolkit UI)."""
     print(f"[xiaoming] {notice.message}", flush=True)
+
+
+def _append_tui_notices(text: str, notices: list[CoordinatorNotice]) -> str:
+    for notice in notices:
+        text += f"\n[xiaoming] {notice.message}"
+    return text
+
+
+def _append_tui_notices_to_buffer(output_buffer, notices: list[CoordinatorNotice]) -> None:
+    output_buffer.text = _append_tui_notices(output_buffer.text, notices)
+    output_buffer.cursor_position = len(output_buffer.text)
 
 
 # Backward-compatible stubs (kept for existing test imports)

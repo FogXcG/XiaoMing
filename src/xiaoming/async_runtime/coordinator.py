@@ -21,6 +21,7 @@ from xiaoming.async_runtime.task_store import TaskStore
 from xiaoming.async_runtime.tasks import ReviewReport, TaskRecord, TaskRegistry, TaskSpec, TaskResultReport, VerificationResult, WorkerSubmission
 from xiaoming.async_runtime.verifier import TaskVerifier, Verifier
 from xiaoming.async_runtime.worker_process import WorkerConfig, WorkerProcess
+from xiaoming.async_runtime.workers import WorkerHandle
 from xiaoming.session import Session
 from xiaoming.tools.base import ToolResult
 
@@ -76,8 +77,7 @@ class AsyncCoordinator:
         self._cancel_mailbox_messages_for_terminal_tasks()
         self._input_queue: queue.Queue[UserMessage] = queue.Queue()
         self._worker_events: queue.Queue[WorkerEvent] = queue.Queue()
-        self._workers: dict[str, WorkerProcess] = {}
-        self._promoted_cancel_callbacks: dict[str, Callable[[], None]] = {}
+        self._workers: dict[str, WorkerHandle] = {}
         self._peer_reply_queues: dict[str, queue.Queue[str]] = {}
         self._verifier_workers: dict[str, WorkerProcess] = {}
         self._verifier_parent_ids: dict[str, str] = {}
@@ -123,6 +123,9 @@ class AsyncCoordinator:
         self._input_queue.put(UserMessage(stripped))
         return ""
 
+    def submit_worker_event(self, event: WorkerEvent) -> None:
+        self._worker_events.put(event)
+
     def reply_mailbox_message(self, message_id: str, normalized_answer: str, decision: str = "none", message_to_user: str = "", authorization_note: str = "") -> ToolResult:
         if decision not in {"approved", "denied", "none"}:
             return ToolResult("reply_mailbox_message", "error", error=f"invalid decision: {decision}")
@@ -157,65 +160,16 @@ class AsyncCoordinator:
             self._persist()
             return ToolResult("schedule_background_task", "success", output=_decision_summary(decision))
 
-    def register_promoted_foreground_task(
-        self,
-        title: str,
-        original_request: str,
-        session_id: str,
-        cancel_callback: Callable[[], None] | None = None,
-    ) -> str:
-        task = TaskRecord(
-            title=title.strip() or "前台转后台任务",
-            original_request=original_request,
-            current_goal=original_request,
-            task_spec=TaskSpec.from_request(original_request, title=title),
-            status="running",
-            agent_type="promoted_foreground",
-            context_policy="promoted",
-        )
-        task.task_decision_log.append(f"promoted foreground session: {session_id}")
+    def register_running_worker_task(self, task: TaskRecord, worker: WorkerHandle) -> str:
         with self._lock:
+            task.status = "running"
+            task.agent_type = task.agent_type or "local_thread"
             self.registry.add(task)
-            if cancel_callback is not None:
-                self._promoted_cancel_callbacks[task.task_id] = cancel_callback
+            self._workers[task.task_id] = worker
+            task.worker_pid = worker.pid
+            task.transition("running", "worker registered")
             self._persist()
-        return task.task_id
-
-    def complete_promoted_foreground_task(self, task_id: str, status: str, summary: str) -> None:
-        with self._lock:
-            task = self.registry.get(task_id)
-            if task is None:
-                return
-            if task.status in TERMINAL_TASK_STATUSES:
-                return
-            terminal_status = "failed" if status == "failed" or task.last_worker_answer_decision == "denied" else "accepted"
-            task.transition(terminal_status, summary)
-            self.registry.clear_current_if(task_id)
-            self._promoted_cancel_callbacks.pop(task_id, None)
-            self._persist()
-            if terminal_status == "accepted":
-                self._notice(f"{task.title} 已完成：{summary}", task_id)
-            else:
-                self._notice(f"{task.title} 失败：{summary}", task_id)
-
-    def request_promoted_foreground_approval(self, task_id: str, action: str) -> bool:
-        with self._lock:
-            task = self.registry.get(task_id)
-            if task is None or task.status in TERMINAL_TASK_STATUSES:
-                return False
-            question = Question(task_id=task_id, kind="approval_request", prompt=action, purpose="promoted_foreground_tool_approval")
-            self._record_worker_question_locked(task, question)
-            message = self._record_mailbox_message_for_question_locked(task, question)
-            task.transition("needs_user", "waiting for user approval")
-            self._persist()
-            self._notice_pending_mailbox_question_locked(task_id)
-            while message.status == "pending" and task.status not in TERMINAL_TASK_STATUSES:
-                self._state_changed.wait(timeout=0.5)
-            answered_message = self.mailbox.get(message.message_id) or message
-            decision = str(answered_message.metadata.get("decision") or "").strip()
-            if decision in {"approved", "denied"}:
-                return decision == "approved"
-            return str(answered_message.reply or "").strip().lower() in {"y", "yes", "同意", "允许", "批准", "approved", "approve"}
+            return task.task_id
 
     def tasks_text(self) -> str:
         with self._lock:
@@ -247,8 +201,6 @@ class AsyncCoordinator:
             worker = self._workers.get(normalized_peer_id)
             if worker is None:
                 task = self.registry.get(normalized_peer_id)
-                if task is not None and task.agent_type == "promoted_foreground":
-                    return ToolResult("talk_to_peer", "success", output=_promoted_foreground_talk_reply(task))
                 external = self.external_sessions.get(normalized_peer_id)
                 if external is None:
                     if task is not None:
@@ -691,6 +643,7 @@ class AsyncCoordinator:
             decision = self._decide_worker_question_locked(task, question)
             if decision is not None and decision.decision in {"approved", "denied"}:
                 self.mailbox.reply(message.message_id, decision.answer)
+                message.metadata["decision"] = decision.decision
                 task.last_worker_answer_decision = decision.decision
                 task.worker_question_log.append(
                     f"Auto-answer to {question.request_id}: {decision.answer} (decision={decision.decision}; reason={decision.reason})"
@@ -783,9 +736,6 @@ class AsyncCoordinator:
         worker = self._workers.get(task_id)
         if worker is not None:
             worker.terminate(timeout_seconds=5)
-        promoted_cancel = self._promoted_cancel_callbacks.pop(task_id, None)
-        if promoted_cancel is not None:
-            promoted_cancel()
         self._terminate_verifiers_for_task_locked(task_id)
         task.transition("cancelled", "用户请求取消。")
         self.registry.clear_current_if(task_id)
@@ -1493,13 +1443,6 @@ def _task_status_line(task: TaskRecord, pending_questions: list[str] | None = No
         questions = "  pending: " + " | ".join(pending_questions)
     agent = f" [{task.agent_type}]" if task.agent_type and task.agent_type != "worker" else ""
     return f"{task.task_id[:8]}  {task.title}{agent}  {task.status}  {detail}{questions}"
-
-
-def _promoted_foreground_talk_reply(task: TaskRecord) -> str:
-    progress = task.last_progress.strip() or "暂无新的进展。"
-    if task.status in TERMINAL_TASK_STATUSES:
-        return f"{task.title} 当前状态：{task.status}。{progress}"
-    return f"{task.title} 当前仍在后台执行，状态：{task.status}。{progress}"
 
 
 def _follow_task_snapshot(task: TaskRecord, changed: bool) -> str:

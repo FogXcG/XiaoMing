@@ -1,6 +1,7 @@
 import copy
 import json
 from io import BytesIO
+from pathlib import Path
 import threading
 from typing import Any
 import time
@@ -16,9 +17,8 @@ from xiaoming.progress import ProgressEvent
 from xiaoming.session import Session
 from xiaoming.skills import Skill, SkillLibrary
 from xiaoming.tools.base import ToolResult
-from xiaoming.tools.load_skill import LoadSkillTool
-from xiaoming.tools.install_skill import InstallSkillTool
 from xiaoming.tools.registry import ToolRegistry
+from xiaoming.tools.skill import SkillTool
 
 
 class RecordingSessionEvents:
@@ -302,12 +302,53 @@ class LoadSkillProvider:
         if len(self.requests) == 1:
             return LLMResponse(
                 message="I will load the relevant skill first.",
-                tool_calls=[ToolCall(id="call_1", name="load_skill", args={"name": "frontend"})],
+                tool_calls=[ToolCall(id="call_1", name="skill", args={"action": "load", "name": "frontend"})],
                 output_items=[
                     {
                         "role": "assistant",
                         "content": "I will load the relevant skill first.",
                         "tool_calls": [{"id": "call_1", "type": "function"}],
+                    }
+                ],
+                raw=None,
+            )
+        return LLMResponse(message="Done.", tool_calls=[], output_items=[], raw=None)
+
+
+class InstallThenLoadSkillProvider:
+    def __init__(self):
+        self.requests: list[LLMRequest] = []
+
+    def complete(self, request: LLMRequest) -> LLMResponse:
+        self.requests.append(request)
+        if len(self.requests) == 1:
+            return LLMResponse(
+                message="I will install the skill first.",
+                tool_calls=[
+                    ToolCall(
+                        id="call_install",
+                        name="skill",
+                        args={"action": "install", "url": "https://github.com/acme/skills/tree/main/skills/frontend"},
+                    )
+                ],
+                output_items=[
+                    {
+                        "role": "assistant",
+                        "content": "I will install the skill first.",
+                        "tool_calls": [{"id": "call_install", "type": "function"}],
+                    }
+                ],
+                raw=None,
+            )
+        if len(self.requests) == 2:
+            return LLMResponse(
+                message="I will load the installed skill before using it.",
+                tool_calls=[ToolCall(id="call_load", name="skill", args={"action": "load", "name": "frontend"})],
+                output_items=[
+                    {
+                        "role": "assistant",
+                        "content": "I will load the installed skill before using it.",
+                        "tool_calls": [{"id": "call_load", "type": "function"}],
                     }
                 ],
                 raw=None,
@@ -1563,7 +1604,7 @@ def test_agent_loop_can_load_skill_through_tool():
     provider = LoadSkillProvider()
     loop = AgentLoop(
         provider=provider,
-        registry=ToolRegistry([LoadSkillTool(library)]),
+        registry=ToolRegistry([SkillTool(Path.cwd(), library, approval_mode="auto_edit", approve=lambda action: True)]),
         instructions="rules",
         model="gpt-5",
         temperature=0.2,
@@ -1590,13 +1631,48 @@ def test_agent_loop_can_load_skill_through_tool():
     assert "skill controls HOW" not in rendered
 
 
+def test_agent_loop_installs_then_loads_skill_through_unified_tool(tmp_path):
+    responses = {
+        "https://codeload.github.com/acme/skills/zip/main": _skill_repo_zip(
+            {"skills/frontend/SKILL.md": b"---\nname: frontend\ndescription: Build UI.\n---\nUse semantic markup."}
+        ),
+    }
+    library = SkillLibrary.discover(tmp_path)
+    provider = InstallThenLoadSkillProvider()
+    loop = AgentLoop(
+        provider=provider,
+        registry=ToolRegistry([SkillTool(tmp_path, library, approval_mode="auto_edit", approve=lambda action: True, fetch=lambda url: responses[url])]),
+        instructions="rules",
+        model="gpt-5",
+        temperature=0.2,
+        max_output_tokens=4096,
+        max_turns=4,
+        skill_library=library,
+    )
+    session = Session()
+
+    answer = loop.run("安装并使用 frontend skill", session=session)
+
+    assert answer == "Done."
+    assert (tmp_path / ".agents" / "skills" / "frontend" / "SKILL.md").exists()
+    install_output = next(item["output"] for item in provider.requests[1].input_items if item.get("call_id") == "call_install")
+    assert "<skill_install_result>" in install_output
+    assert "<status>installed</status>" in install_output
+    assert "Use semantic markup." not in install_output
+    load_output = next(item["output"] for item in provider.requests[2].input_items if item.get("call_id") == "call_load")
+    assert "<skill>" in load_output
+    assert "<name>frontend</name>" in load_output
+    assert "Use semantic markup." in load_output
+    assert "frontend" in session.loaded_skills
+
+
 def test_agent_loop_logs_loaded_skill_retention(tmp_path):
     library = SkillLibrary([Skill(name="frontend", description="Build UI.", content="Use semantic markup.")])
     provider = LoadSkillProvider()
     logger = XiaomingLogger.create(tmp_path)
     loop = AgentLoop(
         provider=provider,
-        registry=ToolRegistry([LoadSkillTool(library)], logger=logger),
+        registry=ToolRegistry([SkillTool(tmp_path, library, approval_mode="auto_edit", approve=lambda action: True)], logger=logger),
         instructions="rules",
         model="gpt-5",
         temperature=0.2,
@@ -1611,6 +1687,11 @@ def test_agent_loop_logs_loaded_skill_retention(tmp_path):
     log_text = logger.path.read_text()
     assert '"event": "loaded_skill_remembered"' in log_text
     assert '"skill": "frontend"' in log_text
+    assert '"event": "turn_started"' in log_text
+    assert '"turn_id":' in log_text
+    assert '"thread_id":' in log_text
+    assert '"event": "tool_call_started"' in log_text
+    assert '"call_id": "call_1"' in log_text
 
 
 def test_agent_loop_retains_loaded_skill_context_across_user_turns():
@@ -1618,7 +1699,7 @@ def test_agent_loop_retains_loaded_skill_context_across_user_turns():
     provider = LoadSkillProvider()
     loop = AgentLoop(
         provider=provider,
-        registry=ToolRegistry([LoadSkillTool(library)]),
+        registry=ToolRegistry([SkillTool(Path.cwd(), library, approval_mode="auto_edit", approve=lambda action: True)]),
         instructions="rules",
         model="gpt-5",
         temperature=0.2,
@@ -1642,7 +1723,7 @@ def test_load_skill_tool_refreshes_library_on_miss(tmp_path):
     skill_dir.mkdir(parents=True)
     (skill_dir / "SKILL.md").write_text("---\nname: writing-plans\ndescription: Write plans.\n---\nBody\n")
 
-    result = LoadSkillTool(library, workspace=tmp_path).run({"name": "writing-plans"})
+    result = SkillTool(tmp_path, library, approval_mode="auto_edit", approve=lambda action: True).run({"action": "load", "name": "writing-plans"})
 
     assert result.status == "success"
     assert "<name>writing-plans</name>" in result.output
@@ -1656,12 +1737,12 @@ def test_install_skill_tool_refreshes_library_after_install(tmp_path):
         ),
     }
     library = SkillLibrary.discover(tmp_path)
-    tool = InstallSkillTool(tmp_path, library, approval_mode="auto_edit", approve=lambda action: True, fetch=lambda url: responses[url])
+    tool = SkillTool(tmp_path, library, approval_mode="auto_edit", approve=lambda action: True, fetch=lambda url: responses[url])
 
-    result = tool.run({"url": "https://github.com/acme/skills/tree/main/skills/frontend"})
+    result = tool.run({"action": "install", "url": "https://github.com/acme/skills/tree/main/skills/frontend"})
 
     assert result.status == "success"
-    assert "Installed skill: frontend" in result.output
+    assert "<name>frontend</name>" in result.output
     assert library.load("frontend") is not None
 
 
@@ -1675,22 +1756,22 @@ def test_install_skill_tool_accepts_repo_and_paths(tmp_path):
         ),
     }
     library = SkillLibrary.discover(tmp_path)
-    tool = InstallSkillTool(tmp_path, library, approval_mode="auto_edit", approve=lambda action: True, fetch=lambda url: responses[url])
+    tool = SkillTool(tmp_path, library, approval_mode="auto_edit", approve=lambda action: True, fetch=lambda url: responses[url])
 
-    result = tool.run({"repo": "acme/skills", "paths": ["skills/frontend", "skills/backend"]})
+    result = tool.run({"action": "install", "repo": "acme/skills", "paths": ["skills/frontend", "skills/backend"]})
 
     assert result.status == "success"
-    assert "Installed skill: frontend" in result.output
-    assert "Installed skill: backend" in result.output
+    assert "<name>frontend</name>" in result.output
+    assert "<name>backend</name>" in result.output
     assert library.load("frontend") is not None
     assert library.load("backend") is not None
 
 
 def test_install_skill_tool_rejects_string_paths(tmp_path):
     library = SkillLibrary.discover(tmp_path)
-    tool = InstallSkillTool(tmp_path, library, approval_mode="auto_edit", approve=lambda action: True, fetch=lambda url: b"")
+    tool = SkillTool(tmp_path, library, approval_mode="auto_edit", approve=lambda action: True, fetch=lambda url: b"")
 
-    result = tool.run({"repo": "acme/skills", "paths": "skills/frontend"})
+    result = tool.run({"action": "install", "repo": "acme/skills", "paths": "skills/frontend"})
 
     assert result.status == "error"
     assert "paths must be an array" in result.error

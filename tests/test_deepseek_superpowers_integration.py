@@ -7,8 +7,8 @@ from xiaoming.llm.deepseek_provider import DeepSeekProvider
 from xiaoming.session import Session
 from xiaoming.tools.background_task import BackgroundTasksStatusTool, ScheduleBackgroundTaskTool
 from xiaoming.tools.base import ToolResult
-from xiaoming.tools.load_skill import LoadSkillTool
 from xiaoming.tools.registry import ToolRegistry
+from xiaoming.tools.skill import SkillTool
 
 
 class ScriptedCoordinator:
@@ -35,7 +35,7 @@ def test_deepseek_superpowers_skill_install_retry_with_git_clone(tmp_path):
     coordinator = ScriptedCoordinator()
     registry = ToolRegistry(
         [
-            LoadSkillTool(_SkillLibrary(), workspace=tmp_path),
+            SkillTool(tmp_path, _SkillLibrary(), approval_mode="auto_edit", approve=lambda action: True),
             ScheduleBackgroundTaskTool(lambda: coordinator),
             BackgroundTasksStatusTool(lambda: coordinator),
         ]
@@ -96,7 +96,7 @@ class _Skill:
 _INSTRUCTIONS = """
 In this runtime, act as a local coding agent.
 Answer simple questions directly.
-When the user asks to install a skill, first briefly explain that installation changes the workspace, then call load_skill for skill-installer, then call schedule_background_task with a complete structured task contract.
+When the user asks to install a skill, first briefly explain that installation changes the workspace, then call skill with action=load for skill-installer, then call schedule_background_task with a complete structured task contract.
 When the user asks about install progress or references a failed install, call background_tasks_status before deciding next steps.
 If a background install failed and the user asks to use git clone, schedule a new background task whose goal explicitly uses git clone.
 Do not claim a background task is completed unless the status says it was accepted or completed successfully.

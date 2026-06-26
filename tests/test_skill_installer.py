@@ -1,7 +1,9 @@
 from pathlib import Path
 from io import BytesIO
+import subprocess
 import zipfile
 
+from xiaoming import skill_installer
 from xiaoming.skill_installer import GithubSkillSource, SkillInstallError, install_skill_from_url, install_skills_from_github, parse_github_tree_url
 
 
@@ -119,6 +121,23 @@ def test_install_skill_reports_download_failures(tmp_path: Path):
         assert "network down" in str(exc)
     else:
         raise AssertionError("expected install error")
+
+
+def test_run_git_is_noninteractive(monkeypatch):
+    captured = {}
+
+    def fake_run_noninteractive(args, **kwargs):
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(skill_installer, "run_noninteractive", fake_run_noninteractive)
+
+    skill_installer._run_git(["git", "ls-remote", "https://example.test/repo.git"])
+
+    assert captured["kwargs"]["stdout"] == subprocess.PIPE
+    assert captured["kwargs"]["stderr"] == subprocess.PIPE
+    assert captured["kwargs"]["text"] is True
 
 
 def _repo_zip(files: dict[str, bytes]) -> bytes:

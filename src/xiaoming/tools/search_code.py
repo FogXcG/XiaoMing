@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 from pathlib import Path
-import subprocess
 from typing import Any
 
 from xiaoming.context.truncation import truncate_middle
 from xiaoming.llm.types import ToolSpec
 from xiaoming.permissions.types import PermissionBehavior
 from xiaoming.policy.paths import resolve_workspace_path
+from xiaoming.subprocess_utils import run_noninteractive
 from xiaoming.tools.base import ToolResult
 
 
@@ -43,7 +43,7 @@ class SearchCodeTool:
                 if decision.behavior == PermissionBehavior.ASK:
                     return ToolResult(self.name, "error", error=f"search requires approval: {decision.reason}")
             base = resolve_workspace_path(self.workspace, path_text, allow_sensitive=self.permission_engine is not None)
-            completed = subprocess.run(
+            completed = run_noninteractive(
                 ["rg", "--line-number", "--no-heading", args["query"], str(base)],
                 cwd=self.workspace,
                 text=True,
